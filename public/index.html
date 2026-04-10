@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>에너지 관리 시스템</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/ko.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/plugins/monthSelect/index.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/plugins/monthSelect/style.css">
+    <!-- Favicon and App Icons -->
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+    <link rel="manifest" href="/site.webmanifest">
+</head>
+<body>
+    <div id="loginView" class="login-container">
+        <div class="login-box">
+            <h1>에너지 관리 시스템</h1>
+            <div class="login-icon">
+                <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="#4CAF50" stroke-width="2">
+                    <path d="M13 2L3 14h8l-2 8 10-12h-8l2-8z"/>
+                </svg>
+            </div>
+            <form id="loginForm">
+                <div class="form-group">
+                    <label for="facilityName">시설명</label>
+                    <input type="text" id="facilityName" name="facilityName" required autofocus>
+                </div>
+                <div class="form-group">
+                    <label for="username">아이디</label>
+                    <input type="text" id="username" name="username" required>
+                </div>
+                <div class="form-group">
+                    <label for="password">비밀번호</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <div id="errorMessage" class="error-message"></div>
+                <button type="submit" class="login-btn">로그인</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="dashboardView" class="dashboard-container" style="display: none;">
+        <div class="header">
+            <h1>에너지 관리 시스템</h1>
+            <div class="user-info">
+                <span class="user-name" id="userName"></span>
+                <button class="logout-btn" id="logoutBtn">로그아웃</button>
+            </div>
+        </div>
+
+        <div class="content">
+            <div class="tabs">
+                <button class="tab active" data-tab="energy">에너지 사용량 입력</button>
+                <button class="tab" data-tab="dataView">데이터 조회</button>
+                <button class="tab" data-tab="admin">관리자 모드</button>
+            </div>
+
+            <div id="energy" class="tab-content active">
+                <h2>에너지 사용량 입력</h2>
+
+                <div class="energy-section">
+                    <div class="ocr-upload-section">
+                        <h3>고지서 이미지로 자동 입력</h3>
+                        <p class="ocr-description">고지서 이미지(JPEG, PNG)를 업로드하면 자동으로 정보를 추출합니다.</p>
+
+                        <div class="ocr-method-selection">
+                            <label style="font-weight: 600; margin-right: 20px;">OCR 방식:</label>
+                            <label class="radio-label">
+                                <input type="radio" name="ocrMethod" value="tesseract" checked>
+                                Tesseract (무료, 브라우저 처리)
+                            </label>
+                            <label class="radio-label">
+                                <input type="radio" name="ocrMethod" value="clova">
+                                네이버 클로바 (고정밀, API 키 필요)
+                            </label>
+                        </div>
+
+                        <div id="clovaApiKeySection" class="clova-api-section" style="display: none;">
+                            <div class="api-key-input-group">
+                                <input type="text" id="clovaApiUrl" placeholder="APIGW Invoke URL" class="api-key-input">
+                                <input type="password" id="clovaSecretKey" placeholder="Secret Key" class="api-key-input">
+                                <button type="button" class="save-api-btn" id="saveApiKeyBtn">저장</button>
+                                <button type="button" class="validate-api-btn" id="validateApiKeyBtn">API 키 검증</button>
+                            </div>
+                            <p class="api-key-help">
+                                <strong>API 키 발급 방법:</strong><br>
+                                1. <a href="https://www.ncloud.com/product/aiService/ocr" target="_blank">네이버 클라우드 플랫폼</a> 접속 → 회원가입/로그인<br>
+                                2. 콘솔 → AI·NAVER API → AI Service → CLOVA OCR → 이용 신청<br>
+                                3. <strong>General OCR</strong> 도메인 생성 (Template OCR 아님!)<br>
+                                4. 생성된 도메인 클릭 → <strong>"APIGW Invoke URL"</strong> 전체 복사<br>
+                                   (예: https://xxxxx.apigw.ntruss.com/custom/v1/xxxxx/xxxxxxxx)<br>
+                                5. 같은 페이지에서 <strong>"Secret Key"</strong> 복사<br>
+                                6. 위 입력란에 붙여넣고 <strong>"API 키 검증"</strong> 버튼으로 확인<br>
+                                <small>※ 월 1,000건까지 무료, 이후 건당 약 3원</small><br>
+                                <small style="color: #d32f2f;">⚠️ 중요: URL 전체를 복사하세요 (https://부터 끝까지)</small>
+                            </p>
+                        </div>
+
+                        <div class="file-upload-container">
+                            <input type="file" id="ocrFileInput" accept=".jpg,.jpeg,.png" style="display: none;">
+                            <button type="button" class="upload-btn" id="ocrUploadBtn">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                    <polyline points="17 8 12 3 7 8"></polyline>
+                                    <line x1="12" y1="3" x2="12" y2="15"></line>
+                                </svg>
+                                고지서 업로드
+                            </button>
+                            <button type="button" class="upload-btn" id="viewOcrTextBtn" style="display: none; background: #2196F3; margin-left: 10px;">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                    <circle cx="12" cy="12" r="3"></circle>
+                                </svg>
+                                인식된 텍스트 보기
+                            </button>
+                            <span id="ocrFileName" class="file-name"></span>
+                            <div id="ocrProgress" class="ocr-progress" style="display: none;">
+                                <div class="progress-bar">
+                                    <div class="progress-fill"></div>
+                                </div>
+                                <span class="progress-text">이미지 분석 중...</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <form id="energyForm" class="energy-form">
+                        <div class="form-row" id="facilitySelectRow" style="display: none;">
+                            <div class="form-group">
+                                <label for="facilityNameSelect">시설명 *</label>
+                                <select id="facilityNameSelect" required>
+                                    <option value="">선택하세요</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="energyType">에너지 종류 *</label>
+                                <select id="energyType" required>
+                                    <option value="">선택하세요</option>
+                                    <option value="전기">전기</option>
+                                    <option value="상하수도">상하수도</option>
+                                    <option value="도시가스">도시가스</option>
+                                    <option value="통신">통신</option>
+                                </select>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="billingMonth">월</label>
+                                <input type="text" id="billingMonth" placeholder="월을 선택하세요" readonly style="cursor: pointer; background-color: white;">
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group" style="flex: 1;">
+                                <label for="startDate">사용 기간 *</label>
+                                <input type="text" id="startDate" placeholder="날짜 범위를 선택하세요" required>
+                                <input type="hidden" id="endDate">
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="usageAmount">사용량 *</label>
+                                <input type="text" id="usageAmount" placeholder="0" required>
+                                <span class="unit-label" id="usageUnit">kWh</span>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="usageCost">사용 금액 (원) *</label>
+                                <input type="text" id="usageCost" placeholder="0" required>
+                                <span class="unit-label">원</span>
+                            </div>
+                        </div>
+
+                        <div class="form-actions">
+                            <button type="submit" class="submit-btn">저장</button>
+                            <button type="reset" class="reset-btn">초기화</button>
+                        </div>
+                    </form>
+
+                </div>
+            </div>
+
+            <div id="dataView" class="tab-content">
+                <h2>데이터 조회</h2>
+
+                <div class="data-view-section">
+                    <div class="filter-form">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="filterFacility">시설 선택</label>
+                                <select id="filterFacility">
+                                    <option value="">전체</option>
+                                </select>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="filterEnergyType">에너지 종류</label>
+                                <select id="filterEnergyType">
+                                    <option value="">전체</option>
+                                    <option value="전기">전기</option>
+                                    <option value="상하수도">상하수도</option>
+                                    <option value="도시가스">도시가스</option>
+                                    <option value="통신">통신</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group" style="flex: 1;">
+                                <label>조회 기간 (월분)</label>
+                                <div style="display: flex; gap: 10px; align-items: center;">
+                                    <input type="month" id="filterStartMonth" placeholder="시작 월">
+                                    <span>~</span>
+                                    <input type="month" id="filterEndMonth" placeholder="종료 월">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="form-actions">
+                            <button type="button" class="submit-btn" id="searchDataBtn">조회</button>
+                            <button type="button" class="reset-btn" id="resetFilterBtn">초기화</button>
+                            <button type="button" class="submit-btn" id="downloadExcelBtn" style="background-color: #2e7d32;">엑셀 다운로드</button>
+                            <button type="button" class="submit-btn" id="uploadExcelBtn" style="background-color: #1976d2;">엑셀 업로드</button>
+                            <button type="button" class="submit-btn" id="generateOfficialDocBtn" style="background-color: #f57c00;">공문 생성</button>
+                            <button type="button" class="submit-btn" id="generateAttachmentBtn" style="background-color: #7b1fa2;">첨부문서 생성</button>
+                            <input type="file" id="excelFileInput" accept=".xlsx,.xls" style="display: none;">
+                        </div>
+                    </div>
+
+                    <div class="data-summary">
+                        <h3>조회 결과 요약 (에너지 종류별)</h3>
+                        <div class="summary-cards">
+                            <!-- 동적으로 생성됨 -->
+                        </div>
+                    </div>
+
+                    <div class="data-charts">
+                        <h3>데이터 분석</h3>
+                        <div class="chart-container">
+                            <div class="chart-box">
+                                <h4>기간별 에너지 사용량 (종류별)</h4>
+                                <canvas id="energyUsageChart"></canvas>
+                            </div>
+                            <div class="chart-box">
+                                <h4>기간별 에너지 비용 (종류별)</h4>
+                                <canvas id="energyCostChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="data-results">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                            <h3 style="margin: 0;">상세 내역</h3>
+                            <button type="button" class="delete-btn" id="deleteSelectedBtn" style="display: none;">선택 항목 삭제</button>
+                        </div>
+                        <table class="energy-table">
+                            <thead>
+                                <tr>
+                                    <th style="width: 50px;">
+                                        <input type="checkbox" id="selectAllCheckbox">
+                                    </th>
+                                    <th>시설명</th>
+                                    <th>월</th>
+                                    <th>사용 기간</th>
+                                    <th>에너지 종류</th>
+                                    <th>사용량</th>
+                                    <th>사용 금액</th>
+                                    <th>공문 생성</th>
+                                    <th>첨부문서 생성</th>
+                                </tr>
+                            </thead>
+                            <tbody id="dataViewTableBody">
+                            </tbody>
+                        </table>
+                        <!-- 페이지네이션 -->
+                        <div id="paginationContainer" style="display: flex; justify-content: center; align-items: center; gap: 5px; margin: 20px 0; flex-wrap: wrap;"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="admin" class="tab-content">
+                <h2>관리자 모드</h2>
+
+                <div class="admin-section">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h3 style="margin: 0;">시설 목록</h3>
+                        <div>
+                            <button class="add-btn" id="addFacilityBtn">시설 추가</button>
+                            <button type="button" class="submit-btn" id="downloadFacilityExcelBtn" style="background-color: #2e7d32; margin-left: 10px;">엑셀 다운로드</button>
+                            <button type="button" class="submit-btn" id="uploadFacilityExcelBtn" style="background-color: #1976d2; margin-left: 10px;">엑셀 업로드</button>
+                            <button type="button" class="submit-btn" id="editSelectedFacilityBtn" style="display: none; margin-left: 10px; background-color: #ff9800;">선택 항목 수정</button>
+                            <button type="button" class="delete-btn" id="deleteSelectedFacilitiesBtn" style="display: none; margin-left: 10px;">선택 항목 삭제</button>
+                            <input type="file" id="facilityExcelFileInput" accept=".xlsx,.xls" style="display: none;">
+                        </div>
+                    </div>
+                    <table class="facility-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 50px;">
+                                    <input type="checkbox" id="selectAllFacilitiesCheckbox">
+                                </th>
+                                <th>시설명</th>
+                                <th>아이디</th>
+                                <th>비밀번호</th>
+                                <th>역할</th>
+                                <th>상위시설</th>
+                                <th>작업</th>
+                            </tr>
+                        </thead>
+                        <tbody id="facilityTableBody">
+                        </tbody>
+                    </table>
+                    <!-- 시설 목록 페이지네이션 -->
+                    <div id="facilityPaginationContainer" style="display: flex; justify-content: center; align-items: center; gap: 5px; margin: 20px 0; flex-wrap: wrap;"></div>
+                </div>
+
+                <div class="admin-section" style="margin-top: 40px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h3 style="margin: 0;">에너지 정보 관리</h3>
+                        <div>
+                            <button class="add-btn" id="addEnergyInfoBtn">에너지 정보 추가</button>
+                            <button type="button" class="submit-btn" id="downloadEnergyInfoExcelBtn" style="background-color: #2e7d32; margin-left: 10px;">엑셀 다운로드</button>
+                            <button type="button" class="submit-btn" id="uploadEnergyInfoExcelBtn" style="background-color: #1976d2; margin-left: 10px;">엑셀 업로드</button>
+                            <button type="button" class="delete-btn" id="deleteSelectedEnergyInfoBtn" style="display: none; margin-left: 10px;">선택 항목 삭제</button>
+                            <input type="file" id="energyInfoExcelFileInput" accept=".xlsx,.xls" style="display: none;">
+                        </div>
+                    </div>
+                    <table class="facility-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 50px;">
+                                    <input type="checkbox" id="selectAllEnergyInfoCheckbox">
+                                </th>
+                                <th>시설명</th>
+                                <th>에너지 종류</th>
+                                <th>고객번호(명세서번호)</th>
+                                <th>금융기관</th>
+                                <th>계좌번호</th>
+                                <th>작업</th>
+                            </tr>
+                        </thead>
+                        <tbody id="energyInfoTableBody">
+                        </tbody>
+                    </table>
+                    <!-- 에너지 정보 페이지네이션 -->
+                    <div id="energyInfoPaginationContainer" style="display: flex; justify-content: center; align-items: center; gap: 5px; margin: 20px 0; flex-wrap: wrap;"></div>
+                </div>
+
+                <div class="admin-section" style="margin-top: 40px;">
+                    <h3>데이터 관리</h3>
+                    <div style="padding: 20px; background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; margin-bottom: 20px;">
+                        <p style="margin: 0 0 10px 0; color: #856404;">
+                            <strong>⚠️ 주의:</strong> 이 작업은 되돌릴 수 없습니다.
+                        </p>
+                        <p style="margin: 0 0 15px 0; color: #856404;">
+                            모든 에너지 사용량 데이터가 영구적으로 삭제됩니다.
+                        </p>
+                        <button class="delete-btn" id="deleteAllDataBtn" style="font-size: 14px; padding: 10px 20px;">
+                            모든 에너지 데이터 삭제
+                        </button>
+                    </div>
+                </div>
+
+                <div id="facilityModal" class="modal">
+                    <div class="modal-content">
+                        <span class="close">&times;</span>
+                        <h3 id="modalTitle">시설 추가</h3>
+                        <form id="facilityForm">
+                            <div class="form-group">
+                                <label for="editFacilityName">시설명</label>
+                                <input type="text" id="editFacilityName" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="editId">아이디</label>
+                                <input type="text" id="editId" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="editPassword">비밀번호</label>
+                                <input type="text" id="editPassword" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="editRole">역할</label>
+                                <select id="editRole" required>
+                                    <option value="">선택하세요</option>
+                                    <option value="관리자">관리자</option>
+                                    <option value="시설관리자">시설관리자</option>
+                                    <option value="시설담당자">시설담당자</option>
+                                </select>
+                            </div>
+                            <div class="modal-buttons">
+                                <button type="submit" class="save-btn">저장</button>
+                                <button type="button" class="cancel-btn">취소</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <div id="energyInfoModal" class="modal">
+                    <div class="modal-content">
+                        <span class="close-energy-info">&times;</span>
+                        <h3 id="energyInfoModalTitle">에너지 정보 추가</h3>
+                        <form id="energyInfoForm">
+                            <div class="form-group">
+                                <label for="editInfoFacilityName">시설명</label>
+                                <select id="editInfoFacilityName" required>
+                                    <option value="">선택하세요</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="editInfoEnergyType">에너지 종류</label>
+                                <select id="editInfoEnergyType" required>
+                                    <option value="">선택하세요</option>
+                                    <option value="전기">전기</option>
+                                    <option value="상하수도">상하수도</option>
+                                    <option value="도시가스">도시가스</option>
+                                    <option value="통신">통신</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="editInfoCustomerNumber">고객번호(명세서번호)</label>
+                                <input type="text" id="editInfoCustomerNumber" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="editInfoBankName">금융기관</label>
+                                <input type="text" id="editInfoBankName" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="editInfoAccountNumber">계좌번호</label>
+                                <input type="text" id="editInfoAccountNumber" required>
+                            </div>
+                            <div class="modal-buttons">
+                                <button type="submit" class="save-btn">저장</button>
+                                <button type="button" class="cancel-energy-info-btn">취소</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+    <script src="excel-functions.js"></script>
+    <script src="admin-functions.js"></script>
+</body>
+</html>
