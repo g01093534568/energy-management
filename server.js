@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const session = require('express-session');
 const bodyParser = require('body-parser');
@@ -5,13 +7,17 @@ const xlsx = require('xlsx');
 const { Document, Packer, Paragraph, TextRun, AlignmentType } = require('docx');
 const fs = require('fs');
 const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = 3000;
-const EXCEL_FILE = path.join(__dirname, 'front end', 'id, pw.xlsx');
-const ENERGY_FILE = path.join(__dirname, 'back end', '에너지사용 data.xlsx');
-const ENERGY_INFO_FILE = path.join(__dirname, 'back end', 'energy_info.xlsx');
 const ATTACHMENT_TEMPLATE_FILE = path.join(__dirname, 'public', '첨부 2 서식.xlsx');
+
+// Supabase 클라이언트 초기화
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
 // Body parser 설정 - 이미지 업로드를 위해 크기 제한 증가
 app.use(bodyParser.json({ limit: '50mb' }));
@@ -19,319 +25,87 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 app.use(express.static('public'));
 
 app.use(session({
-  secret: 'energy-management-secret-key',
+  secret: process.env.SESSION_SECRET || 'energy-management-secret-key',
   resave: false,
   saveUninitialized: false,
   cookie: { maxAge: 24 * 60 * 60 * 1000 }
 }));
 
-function loadUsers() {
-  try {
-    const workbook = xlsx.readFile(EXCEL_FILE);
-    const sheetName = workbook.SheetNames[0];
-    const worksheet = workbook.Sheets[sheetName];
-    const data = xlsx.utils.sheet_to_json(worksheet, { header: 1 });
+// ──────────────────────────────────────────────
+// 헬퍼: Supabase 행(snake_case) → camelCase 변환
+// ──────────────────────────────────────────────
 
-    console.log('엑셀 데이터 로드:', data);
-
-    const users = [];
-    for (let i = 1; i < data.length; i++) {
-      const row = data[i];
-      if (row && row.length >= 3 && row[1] && row[2]) {
-        users.push({
-          index: i - 1,
-          facilityName: String(row[0] || '').trim(),
-          id: String(row[1]).trim(),
-          password: String(row[2]).trim(),
-          role: row[3] ? String(row[3]).trim() : '시설담당자', // 기본값: 시설담당자
-          parentFacility: row[4] ? String(row[4]).trim() : '' // 상위시설명 (시설관리자가 관리하는 하위 시설용)
-        });
-      }
-    }
-
-    console.log('로드된 사용자:', users);
-    return users;
-  } catch (error) {
-    console.error('엑셀 파일 로드 오류:', error);
-    return [];
-  }
+function rowToUser(row) {
+  return {
+    id: row.id,
+    facilityName: row.facility_name,
+    username: row.username,
+    password: row.password,
+    role: row.role || '시설담당자',
+    parentFacility: row.parent_facility || ''
+  };
 }
 
-function saveUsers(users) {
-  try {
-    // 헤더를 명시적으로 정의 (올바른 형식으로)
-    const newData = [['시설명', 'id', 'pw', '역할', '상위시설명']];
-
-    users.forEach(user => {
-      newData.push([
-        user.facilityName,
-        user.id,
-        user.password,
-        user.role || '시설담당자',
-        user.parentFacility || ''
-      ]);
-    });
-
-    const workbook = xlsx.utils.book_new();
-    const newWorksheet = xlsx.utils.aoa_to_sheet(newData);
-    xlsx.utils.book_append_sheet(workbook, newWorksheet, 'Sheet1');
-
-    xlsx.writeFile(workbook, EXCEL_FILE);
-    console.log('엑셀 파일 저장 완료');
-    return true;
-  } catch (error) {
-    console.error('엑셀 파일 저장 오류:', error);
-    return false;
-  }
+function rowToEnergyRecord(row) {
+  return {
+    id: row.id,
+    facilityName: row.facility_name,
+    billingMonth: row.billing_month,
+    startDate: row.start_date,
+    endDate: row.end_date,
+    energyType: row.energy_type,
+    usageAmount: row.usage_amount,
+    usageCost: row.usage_cost,
+    bankName: row.bank_name,
+    virtualAccount: row.virtual_account,
+    customerNumber: row.customer_number
+  };
 }
 
-function loadEnergyData() {
-  try {
-    if (!fs.existsSync(ENERGY_FILE)) {
-      const workbook = xlsx.utils.book_new();
-      const worksheet = xlsx.utils.aoa_to_sheet([['년도', '월', '고객번호(뒷자리)', '에너지종류', '사용시설', '가상계좌', '고객번호', '사용기간', '', '', '사용량', '사용금액', '비고']]);
-      xlsx.utils.book_append_sheet(workbook, worksheet, '에너지 사용 내역');
-      xlsx.writeFile(workbook, ENERGY_FILE);
-      return [];
-    }
-
-    const workbook = xlsx.readFile(ENERGY_FILE);
-    const sheetName = workbook.SheetNames[0]; // 첫 번째 시트 사용
-    const worksheet = workbook.Sheets[sheetName];
-    const data = xlsx.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
-
-    const records = [];
-
-    // 헤더 행 찾기 (년도, 월, ... 로 시작하는 행)
-    let headerIndex = -1;
-    for (let i = 0; i < data.length; i++) {
-      const row = data[i];
-      if (row && row[0] === '년도' && row[1] === '월') {
-        headerIndex = i;
-        break;
-      }
-    }
-
-    if (headerIndex === -1) {
-      headerIndex = 3; // 기본값
-    }
-
-    // 헤더 다음 행부터 데이터 파싱
-    for (let i = headerIndex + 1; i < data.length; i++) {
-      const row = data[i];
-      if (!row || row.length < 8) continue;
-
-      // 빈 행 건너뛰기
-      if (!row[0] && !row[1] && !row[3]) continue;
-
-      const year = String(row[0] || '').replace('년', '').trim();
-      const month = String(row[1] || '').replace('월', '').trim();
-      const energyType = String(row[3] || '').replace('료', '').trim();
-      const facilityName = String(row[4] || '').trim();
-      const bankName = String(row[5] || '').trim(); // 금융기관 (F열)
-      const virtualAccount = String(row[6] || '').trim(); // 가상계좌 (G열)
-      const customerNumber = String(row[7] || '').trim(); // 고객번호 (H열)
-      const startDate = row[8]; // 사용기간 시작 (I열)
-      const endDate = row[10]; // 사용기간 종료 (K열, J열은 "~")
-      const usageAmount = row[11] || 0; // 사용량 (L열)
-      const usageCost = row[12] || 0; // 사용금액 (M열)
-
-      if (year && month && energyType && facilityName) {
-        // billingMonth 형식: YYYY-MM
-        const billingMonth = year && month ? `${year}-${String(month).padStart(2, '0')}` : '';
-
-        // 날짜 포맷 변환 (숫자 → YYYY-MM-DD)
-        let formattedStartDate = '';
-        let formattedEndDate = '';
-
-        if (typeof startDate === 'number') {
-          const excelDate = new Date((startDate - 25569) * 86400 * 1000);
-          formattedStartDate = excelDate.toISOString().split('T')[0];
-        } else if (startDate) {
-          formattedStartDate = String(startDate);
-        }
-
-        if (typeof endDate === 'number') {
-          const excelDate = new Date((endDate - 25569) * 86400 * 1000);
-          formattedEndDate = excelDate.toISOString().split('T')[0];
-        } else if (endDate) {
-          formattedEndDate = String(endDate);
-        }
-
-        const record = {
-          facilityName: facilityName,
-          billingMonth: billingMonth,
-          startDate: formattedStartDate,
-          endDate: formattedEndDate,
-          energyType: energyType,
-          usageAmount: typeof usageAmount === 'number' ? usageAmount : 0,
-          usageCost: typeof usageCost === 'number' ? usageCost : 0,
-          bankName: bankName,
-          virtualAccount: virtualAccount,
-          customerNumber: customerNumber
-        };
-
-        records.push(record);
-      }
-    }
-
-    return records;
-  } catch (error) {
-    console.error('에너지 데이터 로드 오류:', error);
-    return [];
-  }
+function rowToEnergyInfo(row) {
+  return {
+    id: row.id,
+    facilityName: row.facility_name,
+    energyType: row.energy_type,
+    customerNumber: row.customer_number,
+    bankName: row.bank_name,
+    accountNumber: row.account_number
+  };
 }
 
-function saveEnergyData(records) {
-  try {
-    const workbook = xlsx.utils.book_new();
+// ──────────────────────────────────────────────
+// 인증 API
+// ──────────────────────────────────────────────
 
-    // 헤더 및 제목 행
-    const data = [
-      ['', '에너지 사용 내역'],
-      [],
-      ['', '', '', '', '', '', '', '', '', '', '', '', '', '(단위 : 원)'],
-      ['년도', '월', '고객번호(뒷자리)', '에너지종류', '사용시설', '금융기관', '가상계좌', '고객번호', '사용기간', '', '', '사용량', '사용금액', '비고']
-    ];
-
-    // 데이터 행 추가
-    records.forEach(record => {
-      const year = record.billingMonth ? record.billingMonth.split('-')[0] + '년' : '';
-      const month = record.billingMonth ? parseInt(record.billingMonth.split('-')[1]) + '월' : '';
-      const energyType = record.energyType + (record.energyType === '통신' ? '료' : '료');
-
-      // 날짜를 Excel 숫자 형식으로 변환
-      let startDateNum = '';
-      let endDateNum = '';
-
-      if (record.startDate) {
-        const startDate = new Date(record.startDate);
-        if (!isNaN(startDate.getTime())) {
-          startDateNum = Math.floor((startDate.getTime() / 86400000) + 25569);
-        }
-      }
-
-      if (record.endDate) {
-        const endDate = new Date(record.endDate);
-        if (!isNaN(endDate.getTime())) {
-          endDateNum = Math.floor((endDate.getTime() / 86400000) + 25569);
-        }
-      }
-
-      data.push([
-        year,
-        month,
-        '', // 고객번호 뒷자리
-        energyType,
-        record.facilityName || '',
-        record.bankName || '', // 금융기관
-        record.virtualAccount || '', // 가상계좌
-        record.customerNumber || '', // 고객번호
-        startDateNum,
-        '~',
-        endDateNum,
-        record.usageAmount || '',
-        record.usageCost || 0,
-        '' // 비고
-      ]);
-    });
-
-    const worksheet = xlsx.utils.aoa_to_sheet(data);
-    xlsx.utils.book_append_sheet(workbook, worksheet, '에너지 사용 내역');
-    xlsx.writeFile(workbook, ENERGY_FILE);
-    console.log('에너지 데이터 저장 완료');
-    return true;
-  } catch (error) {
-    console.error('에너지 데이터 저장 오류:', error);
-    return false;
-  }
-}
-
-function loadEnergyInfo() {
-  try {
-    if (!fs.existsSync(ENERGY_INFO_FILE)) {
-      const workbook = xlsx.utils.book_new();
-      const worksheet = xlsx.utils.aoa_to_sheet([['시설명', '에너지종류', '고객번호', '금융기관', '계좌번호']]);
-      xlsx.utils.book_append_sheet(workbook, worksheet, 'EnergyInfo');
-      xlsx.writeFile(workbook, ENERGY_INFO_FILE);
-      return [];
-    }
-
-    const workbook = xlsx.readFile(ENERGY_INFO_FILE);
-    const sheetName = workbook.SheetNames[0];
-    const worksheet = workbook.Sheets[sheetName];
-    const data = xlsx.utils.sheet_to_json(worksheet, { header: 1 });
-
-    const infos = [];
-    for (let i = 1; i < data.length; i++) {
-      const row = data[i];
-      if (row && row.length >= 5) {
-        infos.push({
-          facilityName: String(row[0] || ''),
-          energyType: String(row[1] || ''),
-          customerNumber: String(row[2] || ''),
-          bankName: String(row[3] || ''),
-          accountNumber: String(row[4] || '')
-        });
-      }
-    }
-
-    return infos;
-  } catch (error) {
-    console.error('에너지 정보 로드 오류:', error);
-    return [];
-  }
-}
-
-function saveEnergyInfo(infos) {
-  try {
-    const workbook = xlsx.utils.book_new();
-    const data = [['시설명', '에너지종류', '고객번호', '금융기관', '계좌번호']];
-
-    infos.forEach(info => {
-      data.push([
-        info.facilityName || '',
-        info.energyType || '',
-        info.customerNumber || '',
-        info.bankName || '',
-        info.accountNumber || ''
-      ]);
-    });
-
-    const worksheet = xlsx.utils.aoa_to_sheet(data);
-    xlsx.utils.book_append_sheet(workbook, worksheet, 'EnergyInfo');
-    xlsx.writeFile(workbook, ENERGY_INFO_FILE);
-    console.log('에너지 정보 저장 완료');
-    return true;
-  } catch (error) {
-    console.error('에너지 정보 저장 오류:', error);
-    return false;
-  }
-}
-
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   const { facilityName, username, password } = req.body;
-  const users = loadUsers();
 
   console.log('로그인 시도:', { facilityName, username, password });
 
-  const user = users.find(u => {
-    const match = u.facilityName === facilityName && u.id === username && u.password === password;
-    console.log(`비교: ${u.facilityName} === ${facilityName} && ${u.id} === ${username} && ${u.password} === ${password} => ${match}`);
-    return match;
-  });
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('facility_name', facilityName)
+      .eq('username', username)
+      .eq('password', password)
+      .single();
 
-  if (user) {
+    if (error || !data) {
+      console.log('로그인 실패');
+      return res.json({ success: false, message: '시설명, 아이디 또는 비밀번호가 올바르지 않습니다.' });
+    }
+
     req.session.user = {
-      id: user.id,
-      facilityName: user.facilityName,
-      role: user.role || '시설담당자'
+      id: data.username,
+      facilityName: data.facility_name,
+      role: data.role || '시설담당자'
     };
     console.log('로그인 성공:', req.session.user);
     res.json({ success: true, user: req.session.user });
-  } else {
-    console.log('로그인 실패');
-    res.json({ success: false, message: '시설명, 아이디 또는 비밀번호가 올바르지 않습니다.' });
+  } catch (err) {
+    console.error('로그인 오류:', err);
+    res.status(500).json({ success: false, message: '로그인 중 오류가 발생했습니다.' });
   }
 });
 
@@ -348,44 +122,46 @@ app.get('/api/check-auth', (req, res) => {
   }
 });
 
-app.get('/api/facilities', (req, res) => {
+// ──────────────────────────────────────────────
+// 시설(users) API
+// ──────────────────────────────────────────────
+
+app.get('/api/facilities', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
 
-  const users = loadUsers();
-  const userRole = req.session.user.role;
-  const userFacilityName = req.session.user.facilityName;
+  try {
+    const userRole = req.session.user.role;
+    const userFacilityName = req.session.user.facilityName;
 
-  // 관리자: 모든 시설 반환 (원본 인덱스 포함)
-  if (userRole === '관리자') {
-    const facilitiesWithIndex = users.map((user, idx) => ({
-      ...user,
-      originalIndex: idx
-    }));
-    return res.json({ success: true, facilities: facilitiesWithIndex });
-  }
+    let query = supabase.from('users').select('*');
 
-  // 시설관리자: 본인 시설 + 하위 시설담당자 반환 (원본 인덱스 포함)
-  if (userRole === '시설관리자') {
-    const managedFacilities = users
-      .map((u, idx) => ({ ...u, originalIndex: idx }))
-      .filter(u =>
-        u.facilityName === userFacilityName ||
-        (u.parentFacility === userFacilityName && u.role === '시설담당자')
+    if (userRole === '관리자') {
+      // 관리자: 모든 시설 조회
+    } else if (userRole === '시설관리자') {
+      // 시설관리자: 본인 시설 + parentFacility가 본인인 시설담당자
+      query = query.or(
+        `facility_name.eq.${userFacilityName},and(parent_facility.eq.${userFacilityName},role.eq.시설담당자)`
       );
+    } else {
+      // 시설담당자: 본인 시설만
+      query = query.eq('facility_name', userFacilityName);
+    }
 
-    return res.json({ success: true, facilities: managedFacilities });
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    const facilities = (data || []).map(rowToUser);
+    res.json({ success: true, facilities });
+  } catch (err) {
+    console.error('시설 조회 오류:', err);
+    res.status(500).json({ success: false, message: '시설 조회 중 오류가 발생했습니다.' });
   }
-
-  // 시설담당자: 본인 시설만 반환 (원본 인덱스 포함)
-  const userFacilityWithIndex = users
-    .map((u, idx) => ({ ...u, originalIndex: idx }))
-    .find(u => u.facilityName === userFacilityName);
-  res.json({ success: true, facilities: userFacilityWithIndex ? [userFacilityWithIndex] : [] });
 });
 
-app.post('/api/facilities', (req, res) => {
+app.post('/api/facilities', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
@@ -393,7 +169,6 @@ app.post('/api/facilities', (req, res) => {
   const userRole = req.session.user.role;
   const userFacilityName = req.session.user.facilityName;
 
-  // 관리자 또는 시설관리자만 시설 추가 가능
   if (userRole !== '관리자' && userRole !== '시설관리자') {
     return res.status(403).json({ success: false, message: '권한이 없습니다.' });
   }
@@ -404,95 +179,120 @@ app.post('/api/facilities', (req, res) => {
     return res.json({ success: false, message: '모든 필드를 입력해주세요.' });
   }
 
-  const users = loadUsers();
+  try {
+    // 중복 확인
+    const { data: existing } = await supabase
+      .from('users')
+      .select('id')
+      .eq('facility_name', facilityName)
+      .eq('username', id)
+      .single();
 
-  const exists = users.find(u => u.facilityName === facilityName && u.id === id);
-  if (exists) {
-    return res.json({ success: false, message: '이미 존재하는 시설명 또는 아이디입니다.' });
-  }
-
-  // 시설관리자는 시설담당자만 추가 가능하고, parentFacility는 자동으로 본인 시설로 설정
-  if (userRole === '시설관리자') {
-    if (role !== '시설담당자') {
-      return res.status(403).json({ success: false, message: '시설관리자는 시설담당자만 추가할 수 있습니다.' });
+    if (existing) {
+      return res.json({ success: false, message: '이미 존재하는 시설명 또는 아이디입니다.' });
     }
-    users.push({ facilityName, id, password, role, parentFacility: userFacilityName });
-  } else {
-    // 관리자는 모든 역할 추가 가능
-    users.push({ facilityName, id, password, role, parentFacility: parentFacility || '' });
-  }
 
-  if (saveUsers(users)) {
+    let insertData = {
+      facility_name: facilityName,
+      username: id,
+      password: password,
+      role: role,
+      parent_facility: parentFacility || ''
+    };
+
+    // 시설관리자는 시설담당자만 추가 가능하고, parentFacility는 자동으로 본인 시설
+    if (userRole === '시설관리자') {
+      if (role !== '시설담당자') {
+        return res.status(403).json({ success: false, message: '시설관리자는 시설담당자만 추가할 수 있습니다.' });
+      }
+      insertData.parent_facility = userFacilityName;
+    }
+
+    const { error } = await supabase.from('users').insert(insertData);
+
+    if (error) throw error;
+
     res.json({ success: true, message: '시설이 추가되었습니다.' });
-  } else {
-    res.json({ success: false, message: '시설 추가 중 오류가 발생했습니다.' });
+  } catch (err) {
+    console.error('시설 추가 오류:', err);
+    res.status(500).json({ success: false, message: '시설 추가 중 오류가 발생했습니다.' });
   }
 });
 
-app.put('/api/facilities/:index', (req, res) => {
+app.put('/api/facilities/:id', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
 
-  const index = parseInt(req.params.index);
+  const targetId = parseInt(req.params.id);
   const { facilityName, id, password, role, parentFacility } = req.body;
 
   if (!facilityName || !id || !password || !role) {
     return res.json({ success: false, message: '모든 필드를 입력해주세요.' });
   }
 
-  const users = loadUsers();
-
-  if (index < 0 || index >= users.length) {
-    return res.json({ success: false, message: '유효하지 않은 인덱스입니다.' });
-  }
-
   const userRole = req.session.user.role;
   const userFacilityName = req.session.user.facilityName;
-  const targetUser = users[index];
 
-  // 관리자: 모든 시설 수정 가능
-  if (userRole === '관리자') {
-    users[index] = { facilityName, id, password, role, parentFacility: parentFacility || '' };
-    if (saveUsers(users)) {
-      return res.json({ success: true, message: '시설 정보가 수정되었습니다.' });
-    } else {
-      return res.json({ success: false, message: '시설 수정 중 오류가 발생했습니다.' });
+  try {
+    // 수정 대상 조회
+    const { data: targetUser, error: fetchError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', targetId)
+      .single();
+
+    if (fetchError || !targetUser) {
+      return res.json({ success: false, message: '유효하지 않은 ID입니다.' });
     }
-  }
 
-  // 시설관리자: 본인 시설 또는 하위 시설담당자 수정 가능
-  if (userRole === '시설관리자') {
-    // 본인 시설 수정
-    if (targetUser.facilityName === userFacilityName) {
-      users[index] = { facilityName, id, password, role, parentFacility: parentFacility || '' };
-      if (saveUsers(users)) {
-        return res.json({ success: true, message: '시설 정보가 수정되었습니다.' });
-      } else {
-        return res.json({ success: false, message: '시설 수정 중 오류가 발생했습니다.' });
+    // 권한 확인
+    if (userRole === '시설관리자') {
+      const isSelf = targetUser.facility_name === userFacilityName;
+      const isChild = targetUser.parent_facility === userFacilityName && targetUser.role === '시설담당자';
+
+      if (!isSelf && !isChild) {
+        return res.status(403).json({ success: false, message: '권한이 없습니다.' });
       }
-    }
-    // 하위 시설담당자 수정
-    else if (targetUser.parentFacility === userFacilityName && targetUser.role === '시설담당자') {
-      if (role !== '시설담당자') {
+
+      if (isChild && role !== '시설담당자') {
         return res.status(403).json({ success: false, message: '시설관리자는 시설담당자만 수정할 수 있습니다.' });
       }
-      users[index] = { facilityName, id, password, role, parentFacility: userFacilityName };
-      if (saveUsers(users)) {
-        return res.json({ success: true, message: '시설 정보가 수정되었습니다.' });
-      } else {
-        return res.json({ success: false, message: '시설 수정 중 오류가 발생했습니다.' });
-      }
-    } else {
-      return res.status(403).json({ success: false, message: '권한이 없습니다.' });
-    }
-  }
 
-  // 시설담당자: 수정 권한 없음
-  return res.status(403).json({ success: false, message: '권한이 없습니다.' });
+      const updateData = {
+        facility_name: facilityName,
+        username: id,
+        password: password,
+        role: role,
+        parent_facility: isChild ? userFacilityName : (parentFacility || '')
+      };
+
+      const { error } = await supabase.from('users').update(updateData).eq('id', targetId);
+      if (error) throw error;
+      return res.json({ success: true, message: '시설 정보가 수정되었습니다.' });
+    }
+
+    if (userRole === '관리자') {
+      const { error } = await supabase.from('users').update({
+        facility_name: facilityName,
+        username: id,
+        password: password,
+        role: role,
+        parent_facility: parentFacility || ''
+      }).eq('id', targetId);
+
+      if (error) throw error;
+      return res.json({ success: true, message: '시설 정보가 수정되었습니다.' });
+    }
+
+    return res.status(403).json({ success: false, message: '권한이 없습니다.' });
+  } catch (err) {
+    console.error('시설 수정 오류:', err);
+    res.status(500).json({ success: false, message: '시설 수정 중 오류가 발생했습니다.' });
+  }
 });
 
-app.delete('/api/facilities/:index', (req, res) => {
+app.delete('/api/facilities/:id', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
@@ -500,258 +300,226 @@ app.delete('/api/facilities/:index', (req, res) => {
   const userRole = req.session.user.role;
   const userFacilityName = req.session.user.facilityName;
 
-  // 관리자 또는 시설관리자만 시설 삭제 가능
   if (userRole !== '관리자' && userRole !== '시설관리자') {
     return res.status(403).json({ success: false, message: '권한이 없습니다.' });
   }
 
-  const index = parseInt(req.params.index);
-  const users = loadUsers();
+  const targetId = parseInt(req.params.id);
 
-  if (index < 0 || index >= users.length) {
-    return res.json({ success: false, message: '유효하지 않은 인덱스입니다.' });
-  }
+  try {
+    const { data: targetUser, error: fetchError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', targetId)
+      .single();
 
-  const targetUser = users[index];
-
-  // 시설관리자는 본인 시설 또는 하위 시설담당자 삭제 가능
-  if (userRole === '시설관리자') {
-    const canDelete = targetUser.facilityName === userFacilityName ||
-                      (targetUser.parentFacility === userFacilityName && targetUser.role === '시설담당자');
-    if (!canDelete) {
-      return res.status(403).json({ success: false, message: '권한이 없습니다.' });
+    if (fetchError || !targetUser) {
+      return res.json({ success: false, message: '유효하지 않은 ID입니다.' });
     }
-  }
 
-  users.splice(index, 1);
+    if (userRole === '시설관리자') {
+      const canDelete =
+        targetUser.facility_name === userFacilityName ||
+        (targetUser.parent_facility === userFacilityName && targetUser.role === '시설담당자');
+      if (!canDelete) {
+        return res.status(403).json({ success: false, message: '권한이 없습니다.' });
+      }
+    }
 
-  if (saveUsers(users)) {
+    const { error } = await supabase.from('users').delete().eq('id', targetId);
+    if (error) throw error;
+
     res.json({ success: true, message: '시설이 삭제되었습니다.' });
-  } else {
-    res.json({ success: false, message: '시설 삭제 중 오류가 발생했습니다.' });
+  } catch (err) {
+    console.error('시설 삭제 오류:', err);
+    res.status(500).json({ success: false, message: '시설 삭제 중 오류가 발생했습니다.' });
   }
 });
 
-app.get('/api/energy', (req, res) => {
+// ──────────────────────────────────────────────
+// 에너지 데이터(energy_records) API
+// ──────────────────────────────────────────────
+
+// 시설관리자의 관리 시설 목록을 Supabase에서 조회
+async function getManagedFacilityNames(userFacilityName) {
+  const { data } = await supabase
+    .from('users')
+    .select('facility_name')
+    .or(`facility_name.eq.${userFacilityName},and(parent_facility.eq.${userFacilityName},role.eq.시설담당자)`);
+  return (data || []).map(u => u.facility_name);
+}
+
+app.get('/api/energy', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
 
-  let records = loadEnergyData();
   const userRole = req.session.user.role;
   const userFacilityName = req.session.user.facilityName;
 
-  // 관리자: 모든 데이터 조회 가능
-  if (userRole === '관리자') {
-    return res.json({ success: true, records: records });
+  try {
+    let query = supabase.from('energy_records').select('*');
+
+    if (userRole === '관리자') {
+      // 모든 데이터 조회
+    } else if (userRole === '시설관리자') {
+      const facilityNames = await getManagedFacilityNames(userFacilityName);
+      query = query.in('facility_name', facilityNames);
+    } else {
+      query = query.eq('facility_name', userFacilityName);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const records = (data || []).map(rowToEnergyRecord);
+    res.json({ success: true, records });
+  } catch (err) {
+    console.error('에너지 데이터 조회 오류:', err);
+    res.status(500).json({ success: false, message: '에너지 데이터 조회 중 오류가 발생했습니다.' });
   }
-
-  // 시설관리자: 본인 시설 + 하위 시설 데이터 조회 가능
-  if (userRole === '시설관리자') {
-    const users = loadUsers();
-    const managedFacilities = users
-      .filter(u =>
-        u.facilityName === userFacilityName ||
-        (u.parentFacility === userFacilityName && u.role === '시설담당자')
-      )
-      .map(u => u.facilityName);
-
-    records = records.filter(record => managedFacilities.includes(record.facilityName));
-    return res.json({ success: true, records: records });
-  }
-
-  // 시설담당자: 본인 시설 데이터만 조회 가능
-  records = records.filter(record => record.facilityName === userFacilityName);
-  res.json({ success: true, records: records });
 });
 
-app.post('/api/energy', (req, res) => {
+app.post('/api/energy', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
 
   const { facilityName, energyType, billingMonth, startDate, endDate, usageAmount, usageCost } = req.body;
 
-  // 권한 확인
   const userRole = req.session.user.role;
   const userFacilityName = req.session.user.facilityName;
 
-  if (userRole === '관리자') {
-    // 관리자: 전 시설 데이터 입력 가능
-  } else if (userRole === '시설관리자') {
-    // 시설관리자: 본인 시설 + 하위 시설 데이터 입력 가능
-    const users = loadUsers();
-    const managedFacilities = users
-      .filter(u =>
-        u.facilityName === userFacilityName ||
-        (u.parentFacility === userFacilityName && u.role === '시설담당자')
-      )
-      .map(u => u.facilityName);
-
-    if (!managedFacilities.includes(facilityName)) {
-      return res.status(403).json({ success: false, message: '해당 시설에 데이터를 입력할 권한이 없습니다.' });
+  try {
+    // 권한 확인
+    if (userRole === '시설관리자') {
+      const facilityNames = await getManagedFacilityNames(userFacilityName);
+      if (!facilityNames.includes(facilityName)) {
+        return res.status(403).json({ success: false, message: '해당 시설에 데이터를 입력할 권한이 없습니다.' });
+      }
+    } else if (userRole === '시설담당자') {
+      if (facilityName !== userFacilityName) {
+        return res.status(403).json({ success: false, message: '해당 시설에 데이터를 입력할 권한이 없습니다.' });
+      }
     }
-  } else if (userRole === '시설담당자') {
-    // 시설담당자: 본인 시설 데이터만 입력 가능
-    if (facilityName !== userFacilityName) {
-      return res.status(403).json({ success: false, message: '해당 시설에 데이터를 입력할 권한이 없습니다.' });
+
+    // 필드 유효성 검사
+    if (!facilityName || !energyType || !startDate || !endDate) {
+      return res.json({ success: false, message: '모든 필드를 입력해주세요.' });
     }
-  }
 
-  console.log('에너지 데이터 입력 요청:', {
-    facilityName,
-    energyType,
-    billingMonth,
-    startDate,
-    endDate,
-    usageAmount,
-    usageCost,
-    types: {
-      facilityName: typeof facilityName,
-      energyType: typeof energyType,
-      billingMonth: typeof billingMonth,
-      usageAmount: typeof usageAmount,
-      usageCost: typeof usageCost
+    if (usageAmount === undefined || usageAmount === null || usageAmount === '' ||
+        usageCost === undefined || usageCost === null || usageCost === '') {
+      return res.json({ success: false, message: '모든 필드를 입력해주세요.' });
     }
-  });
 
-  // 필드 존재 여부 확인
-  if (!facilityName || !energyType || !startDate || !endDate) {
-    console.log('필수 문자열 필드 누락');
-    return res.json({ success: false, message: '모든 필드를 입력해주세요.' });
-  }
+    const parsedUsageAmount = typeof usageAmount === 'number' ? usageAmount : parseFloat(usageAmount);
+    const parsedUsageCost = typeof usageCost === 'number' ? usageCost : parseFloat(usageCost);
 
-  // 숫자 필드 확인 (0도 유효한 값으로 처리, NaN은 거부)
-  if (usageAmount === undefined || usageAmount === null || usageAmount === '' ||
-      usageCost === undefined || usageCost === null || usageCost === '') {
-    console.log('숫자 필드가 비어있음');
-    return res.json({ success: false, message: '모든 필드를 입력해주세요.' });
-  }
+    if (isNaN(parsedUsageAmount) || isNaN(parsedUsageCost)) {
+      return res.json({ success: false, message: '사용량과 사용 금액은 숫자여야 합니다.' });
+    }
 
-  // 숫자 유효성 검사
-  const parsedUsageAmount = typeof usageAmount === 'number' ? usageAmount : parseFloat(usageAmount);
-  const parsedUsageCost = typeof usageCost === 'number' ? usageCost : parseFloat(usageCost);
+    if (new Date(startDate) > new Date(endDate)) {
+      return res.json({ success: false, message: '종료일은 시작일 이후여야 합니다.' });
+    }
 
-  if (isNaN(parsedUsageAmount) || isNaN(parsedUsageCost)) {
-    console.log('숫자 변환 실패:', { parsedUsageAmount, parsedUsageCost });
-    return res.json({ success: false, message: '사용량과 사용 금액은 숫자여야 합니다.' });
-  }
+    const { error } = await supabase.from('energy_records').insert({
+      facility_name: facilityName,
+      energy_type: energyType,
+      billing_month: billingMonth,
+      start_date: startDate,
+      end_date: endDate,
+      usage_amount: parsedUsageAmount,
+      usage_cost: parsedUsageCost
+    });
 
-  if (new Date(startDate) > new Date(endDate)) {
-    return res.json({ success: false, message: '종료일은 시작일 이후여야 합니다.' });
-  }
+    if (error) throw error;
 
-  const records = loadEnergyData();
-  records.push({
-    facilityName,
-    energyType,
-    billingMonth,
-    startDate,
-    endDate,
-    usageAmount: parsedUsageAmount,
-    usageCost: parsedUsageCost
-  });
-
-  if (saveEnergyData(records)) {
-    console.log('에너지 데이터 저장 완료');
     res.json({ success: true, message: '에너지 사용량이 저장되었습니다.' });
-  } else {
-    console.log('에너지 데이터 저장 실패');
-    res.json({ success: false, message: '에너지 데이터 저장 중 오류가 발생했습니다.' });
+  } catch (err) {
+    console.error('에너지 데이터 저장 오류:', err);
+    res.status(500).json({ success: false, message: '에너지 데이터 저장 중 오류가 발생했습니다.' });
   }
 });
 
-app.delete('/api/energy/:index', (req, res) => {
+app.delete('/api/energy/:id', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
 
-  const index = parseInt(req.params.index);
-  const records = loadEnergyData();
-
-  if (index < 0 || index >= records.length) {
-    return res.json({ success: false, message: '유효하지 않은 인덱스입니다.' });
-  }
-
+  const targetId = parseInt(req.params.id);
   const userRole = req.session.user.role;
   const userFacilityName = req.session.user.facilityName;
-  const targetRecord = records[index];
 
-  // 권한 확인
-  if (userRole === '관리자') {
-    // 관리자는 모든 데이터 삭제 가능
-  } else if (userRole === '시설관리자') {
-    // 시설관리자: 본인 시설 + 하위 시설 데이터 삭제 가능
-    const users = loadUsers();
-    const managedFacilities = users
-      .filter(u =>
-        u.facilityName === userFacilityName ||
-        (u.parentFacility === userFacilityName && u.role === '시설담당자')
-      )
-      .map(u => u.facilityName);
+  try {
+    const { data: targetRecord, error: fetchError } = await supabase
+      .from('energy_records')
+      .select('*')
+      .eq('id', targetId)
+      .single();
 
-    if (!managedFacilities.includes(targetRecord.facilityName)) {
-      return res.status(403).json({ success: false, message: '권한이 없습니다.' });
+    if (fetchError || !targetRecord) {
+      return res.json({ success: false, message: '유효하지 않은 ID입니다.' });
     }
-  } else if (userRole === '시설담당자') {
-    // 시설담당자: 본인 시설 데이터만 삭제 가능
-    if (targetRecord.facilityName !== userFacilityName) {
-      return res.status(403).json({ success: false, message: '권한이 없습니다.' });
+
+    if (userRole === '시설관리자') {
+      const facilityNames = await getManagedFacilityNames(userFacilityName);
+      if (!facilityNames.includes(targetRecord.facility_name)) {
+        return res.status(403).json({ success: false, message: '권한이 없습니다.' });
+      }
+    } else if (userRole === '시설담당자') {
+      if (targetRecord.facility_name !== userFacilityName) {
+        return res.status(403).json({ success: false, message: '권한이 없습니다.' });
+      }
     }
-  }
 
-  records.splice(index, 1);
+    const { error } = await supabase.from('energy_records').delete().eq('id', targetId);
+    if (error) throw error;
 
-  if (saveEnergyData(records)) {
     res.json({ success: true, message: '에너지 데이터가 삭제되었습니다.' });
-  } else {
-    res.json({ success: false, message: '에너지 데이터 삭제 중 오류가 발생했습니다.' });
+  } catch (err) {
+    console.error('에너지 데이터 삭제 오류:', err);
+    res.status(500).json({ success: false, message: '에너지 데이터 삭제 중 오류가 발생했습니다.' });
   }
 });
 
-// 에너지 정보 조회 API
-app.get('/api/energy-info', (req, res) => {
+// ──────────────────────────────────────────────
+// 에너지 정보(energy_info) API
+// ──────────────────────────────────────────────
+
+app.get('/api/energy-info', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
 
   try {
-    let infos = loadEnergyInfo();
     const userRole = req.session.user.role;
     const userFacilityName = req.session.user.facilityName;
 
-    // 관리자: 모든 정보 조회 가능
+    let query = supabase.from('energy_info').select('*');
+
     if (userRole === '관리자') {
-      return res.json({ success: true, infos: infos });
+      // 모든 정보 조회
+    } else if (userRole === '시설관리자') {
+      const facilityNames = await getManagedFacilityNames(userFacilityName);
+      query = query.in('facility_name', facilityNames);
+    } else {
+      query = query.eq('facility_name', userFacilityName);
     }
 
-    // 시설관리자: 본인 시설 + 하위 시설 정보 조회 가능
-    if (userRole === '시설관리자') {
-      const users = loadUsers();
-      const managedFacilities = users
-        .filter(u =>
-          u.facilityName === userFacilityName ||
-          (u.parentFacility === userFacilityName && u.role === '시설담당자')
-        )
-        .map(u => u.facilityName);
+    const { data, error } = await query;
+    if (error) throw error;
 
-      infos = infos.filter(info => managedFacilities.includes(info.facilityName));
-      return res.json({ success: true, infos: infos });
-    }
-
-    // 시설담당자: 본인 시설 정보만 조회 가능
-    console.log('시설담당자: 본인 시설만 조회');
-    infos = infos.filter(info => info.facilityName === userFacilityName);
-    console.log('필터링 후 정보 개수:', infos.length);
-    res.json({ success: true, infos: infos });
-  } catch (error) {
-    console.error('에너지 정보 조회 오류:', error);
+    const infos = (data || []).map(rowToEnergyInfo);
+    res.json({ success: true, infos });
+  } catch (err) {
+    console.error('에너지 정보 조회 오류:', err);
     res.status(500).json({ success: false, message: '에너지 정보 조회 중 오류가 발생했습니다.' });
   }
 });
 
-// 에너지 정보 추가 API
-app.post('/api/energy-info', (req, res) => {
+app.post('/api/energy-info', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
@@ -759,258 +527,230 @@ app.post('/api/energy-info', (req, res) => {
   try {
     const { facilityName, energyType, customerNumber, bankName, accountNumber } = req.body;
 
-    // 입력값 검증: 빈 문자열이나 공백만 있는 경우 체크
     if (!facilityName || !facilityName.trim()) {
       return res.json({ success: false, message: '시설명을 입력해주세요.' });
     }
-
     if (!energyType || !energyType.trim()) {
       return res.json({ success: false, message: '에너지 종류를 선택해주세요.' });
     }
-
     if (!customerNumber || !customerNumber.trim()) {
       return res.json({ success: false, message: '고객번호(명세서번호)를 입력해주세요.' });
     }
-
     if (!bankName || !bankName.trim()) {
       return res.json({ success: false, message: '금융기관을 입력해주세요.' });
     }
-
     if (!accountNumber || !accountNumber.trim()) {
       return res.json({ success: false, message: '계좌번호를 입력해주세요.' });
     }
 
-    const infos = loadEnergyInfo();
+    // 중복 확인
+    const { data: existing } = await supabase
+      .from('energy_info')
+      .select('id')
+      .eq('facility_name', facilityName.trim())
+      .eq('energy_type', energyType.trim())
+      .single();
 
-    // 중복 확인 (같은 시설, 같은 에너지 종류)
-    const exists = infos.find(i =>
-      i.facilityName.trim() === facilityName.trim() &&
-      i.energyType.trim() === energyType.trim()
-    );
-
-    if (exists) {
-      console.log('중복된 정보 발견:', exists);
+    if (existing) {
       return res.json({ success: false, message: '해당 시설의 동일한 에너지 종류 정보가 이미 존재합니다.' });
     }
 
-    const newInfo = {
-      facilityName: facilityName.trim(),
-      energyType: energyType.trim(),
-      customerNumber: customerNumber.trim(),
-      bankName: bankName.trim(),
-      accountNumber: accountNumber.trim()
-    };
+    const { error } = await supabase.from('energy_info').insert({
+      facility_name: facilityName.trim(),
+      energy_type: energyType.trim(),
+      customer_number: customerNumber.trim(),
+      bank_name: bankName.trim(),
+      account_number: accountNumber.trim()
+    });
 
-    infos.push(newInfo);
+    if (error) throw error;
 
-    if (saveEnergyInfo(infos)) {
-      console.log('에너지 정보 추가 성공:', newInfo);
-      res.json({ success: true, message: '에너지 정보가 추가되었습니다.' });
-    } else {
-      console.error('에너지 정보 저장 실패');
-      res.json({ success: false, message: '에너지 정보 추가 중 오류가 발생했습니다.' });
-    }
-  } catch (error) {
-    console.error('에너지 정보 추가 오류:', error);
+    res.json({ success: true, message: '에너지 정보가 추가되었습니다.' });
+  } catch (err) {
+    console.error('에너지 정보 추가 오류:', err);
     res.status(500).json({ success: false, message: '에너지 정보 추가 중 오류가 발생했습니다.' });
   }
 });
 
-// 에너지 정보 수정 API
-app.put('/api/energy-info/:index', (req, res) => {
+app.put('/api/energy-info/:id', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
 
   try {
-    const index = parseInt(req.params.index);
+    const targetId = parseInt(req.params.id);
     const { facilityName, energyType, customerNumber, bankName, accountNumber } = req.body;
 
     console.log('=== 에너지 정보 수정 요청 ===');
-    console.log('인덱스:', index);
+    console.log('ID:', targetId);
     console.log('요청 데이터:', { facilityName, energyType, customerNumber, bankName, accountNumber });
 
-    // 입력값 검증
     if (!facilityName || !facilityName.trim()) {
       return res.json({ success: false, message: '시설명을 입력해주세요.' });
     }
-
     if (!energyType || !energyType.trim()) {
       return res.json({ success: false, message: '에너지 종류를 선택해주세요.' });
     }
-
     if (!customerNumber || !customerNumber.trim()) {
       return res.json({ success: false, message: '고객번호(명세서번호)를 입력해주세요.' });
     }
-
     if (!bankName || !bankName.trim()) {
       return res.json({ success: false, message: '금융기관을 입력해주세요.' });
     }
-
     if (!accountNumber || !accountNumber.trim()) {
       return res.json({ success: false, message: '계좌번호를 입력해주세요.' });
     }
 
-    const infos = loadEnergyInfo();
+    // 대상 존재 확인
+    const { data: targetInfo, error: fetchError } = await supabase
+      .from('energy_info')
+      .select('id')
+      .eq('id', targetId)
+      .single();
 
-    if (index < 0 || index >= infos.length) {
-      console.error('유효하지 않은 인덱스:', index, '전체 개수:', infos.length);
-      return res.json({ success: false, message: '유효하지 않은 인덱스입니다.' });
+    if (fetchError || !targetInfo) {
+      return res.json({ success: false, message: '유효하지 않은 ID입니다.' });
     }
 
-    // 수정 시 중복 체크: 다른 항목과 중복되는지 확인 (자기 자신 제외)
-    const duplicate = infos.find((info, idx) =>
-      idx !== index &&
-      info.facilityName.trim() === facilityName.trim() &&
-      info.energyType.trim() === energyType.trim()
-    );
+    // 중복 확인 (자기 자신 제외)
+    const { data: duplicate } = await supabase
+      .from('energy_info')
+      .select('id')
+      .eq('facility_name', facilityName.trim())
+      .eq('energy_type', energyType.trim())
+      .neq('id', targetId)
+      .single();
 
     if (duplicate) {
-      console.log('중복된 정보 발견:', duplicate);
       return res.json({ success: false, message: '해당 시설의 동일한 에너지 종류 정보가 이미 존재합니다.' });
     }
 
-    const updatedInfo = {
-      facilityName: facilityName.trim(),
-      energyType: energyType.trim(),
-      customerNumber: customerNumber.trim(),
-      bankName: bankName.trim(),
-      accountNumber: accountNumber.trim()
-    };
+    const { error } = await supabase.from('energy_info').update({
+      facility_name: facilityName.trim(),
+      energy_type: energyType.trim(),
+      customer_number: customerNumber.trim(),
+      bank_name: bankName.trim(),
+      account_number: accountNumber.trim()
+    }).eq('id', targetId);
 
-    infos[index] = updatedInfo;
+    if (error) throw error;
 
-    if (saveEnergyInfo(infos)) {
-      console.log('에너지 정보 수정 성공:', updatedInfo);
-      res.json({ success: true, message: '에너지 정보가 수정되었습니다.' });
-    } else {
-      console.error('에너지 정보 저장 실패');
-      res.json({ success: false, message: '에너지 정보 수정 중 오류가 발생했습니다.' });
-    }
-  } catch (error) {
-    console.error('에너지 정보 수정 오류:', error);
+    res.json({ success: true, message: '에너지 정보가 수정되었습니다.' });
+  } catch (err) {
+    console.error('에너지 정보 수정 오류:', err);
     res.status(500).json({ success: false, message: '에너지 정보 수정 중 오류가 발생했습니다.' });
   }
 });
 
-// 에너지 정보 삭제 API
-app.delete('/api/energy-info/:index', (req, res) => {
+app.delete('/api/energy-info/:id', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
 
   try {
-    const index = parseInt(req.params.index);
-    const infos = loadEnergyInfo();
+    const targetId = parseInt(req.params.id);
 
-    if (index < 0 || index >= infos.length) {
-      return res.json({ success: false, message: '유효하지 않은 인덱스입니다.' });
+    const { data: targetInfo, error: fetchError } = await supabase
+      .from('energy_info')
+      .select('id')
+      .eq('id', targetId)
+      .single();
+
+    if (fetchError || !targetInfo) {
+      return res.json({ success: false, message: '유효하지 않은 ID입니다.' });
     }
 
-    infos.splice(index, 1);
+    const { error } = await supabase.from('energy_info').delete().eq('id', targetId);
+    if (error) throw error;
 
-    if (saveEnergyInfo(infos)) {
-      res.json({ success: true, message: '에너지 정보가 삭제되었습니다.' });
-    } else {
-      res.json({ success: false, message: '에너지 정보 삭제 중 오류가 발생했습니다.' });
-    }
-  } catch (error) {
-    console.error('에너지 정보 삭제 오류:', error);
+    res.json({ success: true, message: '에너지 정보가 삭제되었습니다.' });
+  } catch (err) {
+    console.error('에너지 정보 삭제 오류:', err);
     res.status(500).json({ success: false, message: '에너지 정보 삭제 중 오류가 발생했습니다.' });
   }
 });
 
-app.get('/api/data-view', (req, res) => {
+// ──────────────────────────────────────────────
+// 데이터 조회 (필터) API
+// ──────────────────────────────────────────────
+
+app.get('/api/data-view', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
 
   const { facility, energyType, startDate, endDate } = req.query;
-  let records = loadEnergyData();
   const userRole = req.session.user.role;
   const userFacilityName = req.session.user.facilityName;
 
-  // 권한에 따라 데이터 필터링
-  if (userRole === '관리자') {
-    // 관리자는 모든 데이터 조회 가능
-  } else if (userRole === '시설관리자') {
-    // 시설관리자: 본인 시설 + 하위 시설 데이터 조회 가능
-    const users = loadUsers();
-    const managedFacilities = users
-      .filter(u =>
-        u.facilityName === userFacilityName ||
-        (u.parentFacility === userFacilityName && u.role === '시설담당자')
-      )
-      .map(u => u.facilityName);
+  try {
+    let query = supabase.from('energy_records').select('*');
 
-    records = records.filter(record => managedFacilities.includes(record.facilityName));
-  } else if (userRole === '시설담당자') {
-    // 시설담당자: 본인 시설 데이터만 조회 가능
-    records = records.filter(record => record.facilityName === userFacilityName);
+    // 역할별 기본 필터
+    if (userRole === '관리자') {
+      // 모든 데이터
+    } else if (userRole === '시설관리자') {
+      const facilityNames = await getManagedFacilityNames(userFacilityName);
+      query = query.in('facility_name', facilityNames);
+    } else {
+      query = query.eq('facility_name', userFacilityName);
+    }
+
+    // 에너지 종류 필터
+    if (energyType) {
+      query = query.eq('energy_type', energyType);
+    }
+
+    // 기간 필터 (billing_month 기준)
+    if (startDate) {
+      const startMonth = startDate.substring(0, 7);
+      query = query.gte('billing_month', startMonth);
+    }
+    if (endDate) {
+      const endMonth = endDate.substring(0, 7);
+      query = query.lte('billing_month', endMonth);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    let records = (data || []).map(rowToEnergyRecord);
+
+    // 시설 필터 (하위 시설 포함 - 클라이언트 측 필터링)
+    if (facility) {
+      // 선택한 시설의 하위 시설 목록 조회
+      const { data: childData } = await supabase
+        .from('users')
+        .select('facility_name')
+        .eq('parent_facility', facility);
+      const childFacilities = (childData || []).map(u => u.facility_name);
+
+      records = records.filter(record => {
+        if (record.facilityName === facility) return true;
+        if (childFacilities.includes(record.facilityName)) return true;
+        if (record.facilityName.startsWith(facility + '(')) return true;
+        return false;
+      });
+    }
+
+    console.log('=== 데이터 조회 API 응답 ===');
+    console.log('총 레코드 수:', records.length);
+    if (records.length > 0) {
+      console.log('첫 번째 레코드 샘플:', JSON.stringify(records[0], null, 2));
+    }
+
+    res.json({ success: true, records });
+  } catch (err) {
+    console.error('데이터 조회 오류:', err);
+    res.status(500).json({ success: false, message: '데이터 조회 중 오류가 발생했습니다.' });
   }
-
-  // 시설 필터 (상위시설 선택 시 하위시설 데이터도 포함)
-  if (facility) {
-    const users = loadUsers();
-
-    // 선택한 시설의 하위 시설 목록 조회
-    // 예: "울주군립야영장" 선택 시 "울주군립야영장(별빛)", "울주군립야영장(달빛)" 등 포함
-    const childFacilities = users
-      .filter(u => u.parentFacility === facility)
-      .map(u => u.facilityName);
-
-    // 시설명이 선택한 시설이거나, 선택한 시설의 하위 시설인 경우 포함
-    // 또는 시설명이 선택한 시설명으로 시작하는 경우도 포함 (괄호로 구분되는 하위시설)
-    records = records.filter(record => {
-      // 정확히 일치
-      if (record.facilityName === facility) return true;
-
-      // parentFacility 관계로 연결된 하위시설
-      if (childFacilities.includes(record.facilityName)) return true;
-
-      // 시설명이 "상위시설명(" 으로 시작하는 경우 (예: "울주군립야영장(별빛)")
-      if (record.facilityName.startsWith(facility + '(')) return true;
-
-      return false;
-    });
-  }
-
-  // 에너지 종류 필터
-  if (energyType) {
-    records = records.filter(record => record.energyType === energyType);
-  }
-
-  // 기간 필터 (월분 기준)
-  if (startDate) {
-    // startDate를 YYYY-MM 형식으로 변환
-    const startMonth = startDate.substring(0, 7); // "YYYY-MM"
-    records = records.filter(record => {
-      const billingMonth = record.billingMonth || '';
-      return billingMonth >= startMonth;
-    });
-  }
-
-  if (endDate) {
-    // endDate를 YYYY-MM 형식으로 변환
-    const endMonth = endDate.substring(0, 7); // "YYYY-MM"
-    records = records.filter(record => {
-      const billingMonth = record.billingMonth || '';
-      return billingMonth <= endMonth;
-    });
-  }
-
-  // 디버깅: 반환되는 데이터 확인
-  console.log('=== 데이터 조회 API 응답 ===');
-  console.log('총 레코드 수:', records.length);
-  if (records.length > 0) {
-    console.log('첫 번째 레코드 샘플:', JSON.stringify(records[0], null, 2));
-  }
-
-  res.json({ success: true, records: records });
 });
 
-// 에너지 데이터 엑셀 업로드
-app.post('/api/energy-data/upload', (req, res) => {
+// ──────────────────────────────────────────────
+// 에너지 데이터 일괄 업로드 API
+// ──────────────────────────────────────────────
+
+app.post('/api/energy-data/upload', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
@@ -1022,39 +762,34 @@ app.post('/api/energy-data/upload', (req, res) => {
   }
 
   try {
-    // 기존 데이터 로드
-    let existingRecords = loadEnergyData();
+    const insertData = newRecords.map(record => ({
+      facility_name: record.facilityName || '',
+      billing_month: record.billingMonth || null,
+      start_date: record.startDate || null,
+      end_date: record.endDate || null,
+      energy_type: record.energyType || '',
+      usage_amount: parseFloat(record.usageAmount) || 0,
+      usage_cost: parseFloat(record.usageCost) || 0,
+      customer_number: record.customerNumber || '',
+      bank_name: record.bankName || '',
+      virtual_account: record.virtualAccount || ''
+    }));
 
-    // 새 데이터 추가
-    newRecords.forEach(record => {
-      existingRecords.push({
-        facilityName: record.facilityName || '',
-        billingMonth: record.billingMonth || '',
-        startDate: record.startDate || '',
-        endDate: record.endDate || '',
-        energyType: record.energyType || '',
-        usageAmount: parseFloat(record.usageAmount) || 0,
-        usageCost: parseFloat(record.usageCost) || 0,
-        customerNumber: record.customerNumber || '',
-        bankName: record.bankName || '',
-        virtualAccount: record.virtualAccount || ''
-      });
-    });
+    const { error } = await supabase.from('energy_records').insert(insertData);
+    if (error) throw error;
 
-    // 데이터 저장
-    if (saveEnergyData(existingRecords)) {
-      res.json({ success: true, message: `${newRecords.length}건의 데이터가 업로드되었습니다.`, count: newRecords.length });
-    } else {
-      res.status(500).json({ success: false, message: '데이터 저장 중 오류가 발생했습니다.' });
-    }
-  } catch (error) {
-    console.error('에너지 데이터 업로드 오류:', error);
+    res.json({ success: true, message: `${newRecords.length}건의 데이터가 업로드되었습니다.`, count: newRecords.length });
+  } catch (err) {
+    console.error('에너지 데이터 업로드 오류:', err);
     res.status(500).json({ success: false, message: '서버 오류가 발생했습니다.' });
   }
 });
 
-// 선택된 에너지 데이터 삭제
-app.post('/api/energy-data/delete-multiple', (req, res) => {
+// ──────────────────────────────────────────────
+// 선택된 에너지 데이터 삭제 API
+// ──────────────────────────────────────────────
+
+app.post('/api/energy-data/delete-multiple', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
@@ -1065,92 +800,109 @@ app.post('/api/energy-data/delete-multiple', (req, res) => {
     return res.status(400).json({ success: false, message: '삭제할 레코드가 없습니다.' });
   }
 
-  try {
-    let allRecords = loadEnergyData();
-    const userRole = req.session.user.role;
-    const userFacilityName = req.session.user.facilityName;
+  const userRole = req.session.user.role;
+  const userFacilityName = req.session.user.facilityName;
 
-    // 권한 확인 및 삭제할 레코드 필터링
-    const recordsToDeleteFiltered = recordsToDelete.filter(recordToDelete => {
-      if (userRole === '관리자') {
-        return true; // 관리자는 모든 데이터 삭제 가능
-      } else if (userRole === '시설관리자') {
-        // 시설관리자: 본인 시설 + 하위 시설 데이터만 삭제 가능
-        const users = loadUsers();
-        const managedFacilities = users
-          .filter(u =>
-            u.facilityName === userFacilityName ||
-            (u.parentFacility === userFacilityName && u.role === '시설담당자')
-          )
-          .map(u => u.facilityName);
-        return managedFacilities.includes(recordToDelete.facilityName);
-      } else if (userRole === '시설담당자') {
-        // 시설담당자: 본인 시설 데이터만 삭제 가능
-        return recordToDelete.facilityName === userFacilityName;
-      }
-      return false;
+  try {
+    // 권한 체크용 시설 목록 준비
+    let allowedFacilities = null;
+    if (userRole === '시설관리자') {
+      allowedFacilities = await getManagedFacilityNames(userFacilityName);
+    } else if (userRole === '시설담당자') {
+      allowedFacilities = [userFacilityName];
+    }
+
+    // 권한이 있는 레코드만 필터링
+    const filteredRecords = recordsToDelete.filter(r => {
+      if (allowedFacilities === null) return true; // 관리자
+      return allowedFacilities.includes(r.facilityName);
     });
 
-    if (recordsToDeleteFiltered.length === 0) {
+    if (filteredRecords.length === 0) {
       return res.status(403).json({ success: false, message: '삭제 권한이 없습니다.' });
     }
 
-    // 삭제할 레코드를 제외한 나머지 레코드 필터링
-    const remainingRecords = allRecords.filter(record => {
-      return !recordsToDeleteFiltered.some(toDelete => {
-        return record.facilityName === toDelete.facilityName &&
-               record.startDate === toDelete.startDate &&
-               record.endDate === toDelete.endDate &&
-               record.energyType === toDelete.energyType &&
-               parseFloat(record.usageAmount) === parseFloat(toDelete.usageAmount) &&
-               parseFloat(record.usageCost) === parseFloat(toDelete.usageCost);
-      });
-    });
+    // 레코드 필드 매칭으로 삭제 (id가 있으면 id 우선, 없으면 필드 매칭)
+    let deletedCount = 0;
+    for (const toDelete of filteredRecords) {
+      if (toDelete.id) {
+        const { error } = await supabase
+          .from('energy_records')
+          .delete()
+          .eq('id', toDelete.id);
+        if (!error) deletedCount++;
+      } else {
+        // id 없을 경우 필드 매칭으로 삭제
+        const { data: matchRows } = await supabase
+          .from('energy_records')
+          .select('id')
+          .eq('facility_name', toDelete.facilityName)
+          .eq('start_date', toDelete.startDate)
+          .eq('end_date', toDelete.endDate)
+          .eq('energy_type', toDelete.energyType)
+          .eq('usage_amount', parseFloat(toDelete.usageAmount))
+          .eq('usage_cost', parseFloat(toDelete.usageCost));
 
-    // 엑셀 파일에 저장
-    if (saveEnergyData(remainingRecords)) {
-      console.log(`${recordsToDeleteFiltered.length}개의 레코드가 삭제되었습니다.`);
-      res.json({ success: true, message: `${recordsToDeleteFiltered.length}개의 레코드가 삭제되었습니다.` });
-    } else {
-      res.status(500).json({ success: false, message: '데이터 저장 중 오류가 발생했습니다.' });
+        if (matchRows && matchRows.length > 0) {
+          const ids = matchRows.map(r => r.id);
+          const { error } = await supabase
+            .from('energy_records')
+            .delete()
+            .in('id', ids);
+          if (!error) deletedCount += ids.length;
+        }
+      }
     }
-  } catch (error) {
-    console.error('데이터 삭제 오류:', error);
+
+    console.log(`${deletedCount}개의 레코드가 삭제되었습니다.`);
+    res.json({ success: true, message: `${deletedCount}개의 레코드가 삭제되었습니다.` });
+  } catch (err) {
+    console.error('데이터 삭제 오류:', err);
     res.status(500).json({ success: false, message: '데이터 삭제 중 오류가 발생했습니다.' });
   }
 });
 
-// 모든 에너지 데이터 삭제 (관리자만 가능)
-app.delete('/api/energy-data/delete-all', (req, res) => {
+// ──────────────────────────────────────────────
+// 모든 에너지 데이터 삭제 API (관리자 전용)
+// ──────────────────────────────────────────────
+
+app.delete('/api/energy-data/delete-all', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
   }
 
   const userRole = req.session.user.role;
 
-  // 관리자만 모든 데이터 삭제 가능
   if (userRole !== '관리자') {
     return res.status(403).json({ success: false, message: '관리자만 모든 데이터를 삭제할 수 있습니다.' });
   }
 
   try {
-    const allRecords = loadEnergyData();
-    const recordCount = allRecords.length;
+    // 전체 건수 조회
+    const { count } = await supabase
+      .from('energy_records')
+      .select('*', { count: 'exact', head: true });
 
-    // 빈 배열로 저장 (모든 데이터 삭제)
-    if (saveEnergyData([])) {
-      console.log(`관리자가 모든 에너지 데이터 삭제: ${recordCount}개`);
-      res.json({ success: true, message: `${recordCount}개의 데이터가 삭제되었습니다.`, deletedCount: recordCount });
-    } else {
-      res.status(500).json({ success: false, message: '데이터 저장 중 오류가 발생했습니다.' });
-    }
-  } catch (error) {
-    console.error('모든 데이터 삭제 오류:', error);
+    // 전체 삭제 (neq로 항상 true인 조건 사용)
+    const { error } = await supabase
+      .from('energy_records')
+      .delete()
+      .neq('id', 0);
+
+    if (error) throw error;
+
+    console.log(`관리자가 모든 에너지 데이터 삭제: ${count}개`);
+    res.json({ success: true, message: `${count}개의 데이터가 삭제되었습니다.`, deletedCount: count });
+  } catch (err) {
+    console.error('모든 데이터 삭제 오류:', err);
     res.status(500).json({ success: false, message: '데이터 삭제 중 오류가 발생했습니다.' });
   }
 });
 
-// 숫자를 한글로 변환하는 함수 (일십, 일백, 일천 포함)
+// ──────────────────────────────────────────────
+// 숫자 → 한글 변환 (공문 생성용)
+// ──────────────────────────────────────────────
+
 function numberToKorean(num) {
   let number = parseInt(num);
   if (number === 0) return '영';
@@ -1172,7 +924,6 @@ function numberToKorean(num) {
       while (tempPart > 0) {
         const digit = tempPart % 10;
         if (digit > 0) {
-          // 1일 때도 항상 "일"을 포함 (일십, 일백, 일천)
           partStr = digits[digit] + positions[posIndex] + partStr;
         }
         tempPart = Math.floor(tempPart / 10);
@@ -1187,7 +938,10 @@ function numberToKorean(num) {
   return result;
 }
 
+// ──────────────────────────────────────────────
 // 공문 생성 API
+// ──────────────────────────────────────────────
+
 app.post('/api/generate-document', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
@@ -1196,15 +950,12 @@ app.post('/api/generate-document', async (req, res) => {
   try {
     const record = req.body;
 
-    // billingMonth가 있으면 사용, 없으면 startDate에서 추출
     let year, month;
     if (record.billingMonth) {
-      // billingMonth 형식: "YYYY-MM"
       const billingParts = record.billingMonth.split('-');
       year = parseInt(billingParts[0]);
       month = parseInt(billingParts[1]);
     } else {
-      // startDate에서 추출
       const startDate = new Date(record.startDate);
       year = startDate.getFullYear();
       month = startDate.getMonth() + 1;
@@ -1213,7 +964,6 @@ app.post('/api/generate-document', async (req, res) => {
     const costNumber = parseInt(record.usageCost);
     const costKorean = numberToKorean(costNumber);
 
-    // 금융기관과 계좌번호 정보 사용
     let paymentMethod = '첨부 2 고지서 참조';
     if (record.bankName && record.virtualAccount) {
       paymentMethod = `계좌입금(${record.bankName} ${record.virtualAccount})`;
@@ -1221,7 +971,6 @@ app.post('/api/generate-document', async (req, res) => {
       paymentMethod = `계좌입금(${record.virtualAccount})`;
     }
 
-    // Word 문서 생성
     const doc = new Document({
       sections: [{
         properties: {},
@@ -1235,9 +984,7 @@ app.post('/api/generate-document', async (req, res) => {
                 size: 32
               })
             ],
-            spacing: {
-              after: 400
-            }
+            spacing: { after: 400 }
           }),
           new Paragraph({
             children: [
@@ -1246,20 +993,11 @@ app.post('/api/generate-document', async (req, res) => {
                 size: 24
               })
             ],
-            spacing: {
-              after: 300
-            }
+            spacing: { after: 300 }
           }),
           new Paragraph({
-            children: [
-              new TextRun({
-                text: '',
-                size: 24
-              })
-            ],
-            spacing: {
-              after: 200
-            }
+            children: [new TextRun({ text: '', size: 24 })],
+            spacing: { after: 200 }
           }),
           new Paragraph({
             children: [
@@ -1268,64 +1006,40 @@ app.post('/api/generate-document', async (req, res) => {
                 size: 24
               })
             ],
-            spacing: {
-              after: 200
-            }
+            spacing: { after: 200 }
           }),
           new Paragraph({
-            children: [
-              new TextRun({
-                text: '  2. 세부내역: 첨부 1 참조',
-                size: 24
-              })
-            ],
-            spacing: {
-              after: 200
-            }
+            children: [new TextRun({ text: '  2. 세부내역: 첨부 1 참조', size: 24 })],
+            spacing: { after: 200 }
           }),
           new Paragraph({
-            children: [
-              new TextRun({
-                text: `  3. 납부방법: ${paymentMethod}`,
-                size: 24
-              })
-            ],
-            spacing: {
-              after: 200
-            }
+            children: [new TextRun({ text: `  3. 납부방법: ${paymentMethod}`, size: 24 })],
+            spacing: { after: 200 }
           }),
           new Paragraph({
-            children: [
-              new TextRun({
-                text: '  4. 예산과목: ',
-                size: 24
-              })
-            ],
-            spacing: {
-              after: 400
-            }
+            children: [new TextRun({ text: '  4. 예산과목: ', size: 24 })],
+            spacing: { after: 400 }
           })
         ]
       }]
     });
 
-    // 문서를 버퍼로 변환
     const buffer = await Packer.toBuffer(doc);
-
-    // 파일명 설정
     const filename = `${year}-${String(month).padStart(2, '0')}-${record.facilityName}-${record.energyType}-공문.docx`;
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
     res.send(buffer);
-
   } catch (error) {
     console.error('공문 생성 오류:', error);
     res.status(500).json({ success: false, message: '공문 생성 중 오류가 발생했습니다.' });
   }
 });
 
+// ──────────────────────────────────────────────
 // 첨부1 생성 API (Excel) - 첨부2 서식 사용
+// ──────────────────────────────────────────────
+
 app.post('/api/generate-attachment1', async (req, res) => {
   console.log('=== 첨부1 생성 API 호출 ===');
 
@@ -1343,7 +1057,6 @@ app.post('/api/generate-attachment1', async (req, res) => {
       return res.status(400).json({ success: false, message: '데이터가 없습니다.' });
     }
 
-    // billingMonth가 있으면 사용, 없으면 startDate에서 추출
     let year, month;
     if (record.billingMonth) {
       const billingParts = record.billingMonth.split('-');
@@ -1359,14 +1072,17 @@ app.post('/api/generate-attachment1', async (req, res) => {
     }
     console.log('년월:', year, month);
 
-    // 에너지 정보에서 금융기관과 계좌번호 조회
-    const energyInfos = loadEnergyInfo();
+    // Supabase에서 에너지 정보 조회 (금융기관/계좌번호)
+    const { data: energyInfoData } = await supabase
+      .from('energy_info')
+      .select('*');
+    const energyInfos = (energyInfoData || []).map(rowToEnergyInfo);
+
     let matchingInfo = energyInfos.find(info =>
       info.facilityName === record.facilityName &&
       info.energyType === record.energyType
     );
-    // 정확한 시설명 매칭 실패 시, 상위 시설명으로 폴백 조회
-    // 예: "울주군립야영장(별빛)" → "울주군립야영장"
+    // 상위 시설명으로 폴백 조회
     if (!matchingInfo) {
       const parentMatch = record.facilityName ? record.facilityName.match(/^(.+?)\(/) : null;
       if (parentMatch) {
@@ -1382,7 +1098,7 @@ app.post('/api/generate-attachment1', async (req, res) => {
     const accountNumber = matchingInfo ? matchingInfo.accountNumber : (record.virtualAccount || '');
     console.log('조회된 금융정보:', { bankName, accountNumber, matchingInfo: !!matchingInfo });
 
-    // 템플릿 파일 읽기 (첨부 2 서식 사용)
+    // 템플릿 파일 읽기
     console.log('템플릿 파일 경로:', ATTACHMENT_TEMPLATE_FILE);
     if (!fs.existsSync(ATTACHMENT_TEMPLATE_FILE)) {
       console.error('템플릿 파일이 존재하지 않습니다:', ATTACHMENT_TEMPLATE_FILE);
@@ -1392,70 +1108,32 @@ app.post('/api/generate-attachment1', async (req, res) => {
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
 
-    // 제목 변경: "납부내역" -> "세부내역"
     worksheet['A1'] = { t: 's', v: '세부내역' };
 
-    // 데이터 시작 행 (템플릿의 6행 - 5행에 ~ 구분자가 있음)
     const dataRow = 6;
 
-    // 년도 (A열)
     worksheet['A' + dataRow] = { t: 'n', v: year };
-
-    // 월 (B열)
     worksheet['B' + dataRow] = { t: 'n', v: month };
-
-    // 사용시설 (C열)
     worksheet['C' + dataRow] = { t: 's', v: record.facilityName || '' };
-
-    // 금융기관 (D열)
     worksheet['D' + dataRow] = { t: 's', v: bankName };
-
-    // 계좌번호 (E열)
     worksheet['E' + dataRow] = { t: 's', v: accountNumber };
-
-    // 사용기간 시작 (F열)
     worksheet['F' + dataRow] = { t: 's', v: record.startDate || '' };
-
-    // 사용기간 구분자 (G열)
     worksheet['G' + dataRow] = { t: 's', v: '~' };
-
-    // 사용기간 종료 (H열)
     worksheet['H' + dataRow] = { t: 's', v: record.endDate || '' };
-
-    // 납부금액 (I열) - 천단위 콤마
-    worksheet['I' + dataRow] = {
-      t: 'n',
-      v: parseFloat(record.usageCost) || 0,
-      z: '#,##0'
-    };
-
-    // 비고 (J열) - 에너지 종류
+    worksheet['I' + dataRow] = { t: 'n', v: parseFloat(record.usageCost) || 0, z: '#,##0' };
     worksheet['J' + dataRow] = { t: 's', v: record.energyType || '' };
 
-    // 워크시트 범위 업데이트
     worksheet['!ref'] = xlsx.utils.encode_range({
       s: { r: 0, c: 0 },
       e: { r: dataRow, c: 9 }
     });
 
-    // 열 너비 설정
     worksheet['!cols'] = [
-      { wch: 8 },   // A: 년도
-      { wch: 6 },   // B: 월
-      { wch: 25 },  // C: 사용시설
-      { wch: 12 },  // D: 금융기관
-      { wch: 18 },  // E: 계좌번호
-      { wch: 12 },  // F: 사용기간 시작
-      { wch: 3 },   // G: ~
-      { wch: 12 },  // H: 사용기간 종료
-      { wch: 15 },  // I: 납부금액
-      { wch: 12 }   // J: 비고
+      { wch: 8 }, { wch: 6 }, { wch: 25 }, { wch: 12 }, { wch: 18 },
+      { wch: 12 }, { wch: 3 }, { wch: 12 }, { wch: 15 }, { wch: 12 }
     ];
 
-    // Excel 파일을 버퍼로 변환
     const buffer = xlsx.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-
-    // 파일명 설정
     const filename = `${year}-${String(month).padStart(2, '0')}-${record.facilityName}-${record.energyType}-첨부1.xlsx`;
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -1463,7 +1141,6 @@ app.post('/api/generate-attachment1', async (req, res) => {
     res.send(buffer);
 
     console.log('개별 첨부문서 생성 완료:', filename);
-
   } catch (error) {
     console.error('첨부1 생성 오류:', error.message);
     console.error('스택:', error.stack);
@@ -1471,7 +1148,10 @@ app.post('/api/generate-attachment1', async (req, res) => {
   }
 });
 
-// 선택된 데이터를 하나의 엑셀 파일로 생성하는 API (기존 첨부 2 서식 활용)
+// ──────────────────────────────────────────────
+// 통합 첨부문서 생성 API
+// ──────────────────────────────────────────────
+
 app.post('/api/generate-attachment-combined', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
@@ -1486,10 +1166,12 @@ app.post('/api/generate-attachment-combined', async (req, res) => {
 
     console.log('통합 첨부문서 생성:', records.length, '건');
 
-    // 에너지 정보 로드 (금융기관/계좌번호 조회용)
-    const energyInfos = loadEnergyInfo();
+    // Supabase에서 에너지 정보 조회
+    const { data: energyInfoData } = await supabase
+      .from('energy_info')
+      .select('*');
+    const energyInfos = (energyInfoData || []).map(rowToEnergyInfo);
 
-    // 템플릿 파일 읽기 (첨부 2 서식 사용)
     if (!fs.existsSync(ATTACHMENT_TEMPLATE_FILE)) {
       console.error('템플릿 파일이 존재하지 않습니다:', ATTACHMENT_TEMPLATE_FILE);
       return res.status(500).json({ success: false, message: '템플릿 파일을 찾을 수 없습니다.' });
@@ -1498,27 +1180,16 @@ app.post('/api/generate-attachment-combined', async (req, res) => {
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
 
-    // 제목 변경: "납부내역" -> "세부내역"
     worksheet['A1'] = { t: 's', v: '세부내역' };
 
-    // 합계 금액 계산
     const totalCost = records.reduce((sum, r) => sum + (parseFloat(r.usageCost) || 0), 0);
+    worksheet['I5'] = { t: 'n', v: totalCost, z: '#,##0' };
 
-    // 합계 금액을 I5에 입력
-    worksheet['I5'] = {
-      t: 'n',
-      v: totalCost,
-      z: '#,##0'
-    };
-
-    // 데이터 시작 행 (템플릿의 6행부터)
     const dataStartRow = 6;
 
-    // 각 레코드에 대해 데이터 행 추가
     records.forEach((record, index) => {
       const currentRow = dataStartRow + index;
 
-      // billingMonth에서 년/월 추출
       let year, month;
       if (record.billingMonth) {
         const billingParts = record.billingMonth.split('-');
@@ -1533,13 +1204,10 @@ app.post('/api/generate-attachment-combined', async (req, res) => {
         month = new Date().getMonth() + 1;
       }
 
-      // 에너지 정보에서 금융기관과 계좌번호 조회
       let matchingInfo = energyInfos.find(info =>
         info.facilityName === record.facilityName &&
         info.energyType === record.energyType
       );
-      // 정확한 시설명 매칭 실패 시, 상위 시설명으로 폴백 조회
-      // 예: "울주군립야영장(별빛)" → "울주군립야영장"
       if (!matchingInfo) {
         const parentMatch = record.facilityName ? record.facilityName.match(/^(.+?)\(/) : null;
         if (parentMatch) {
@@ -1553,66 +1221,30 @@ app.post('/api/generate-attachment-combined', async (req, res) => {
       const bankName = matchingInfo ? matchingInfo.bankName : (record.bankName || '');
       const accountNumber = matchingInfo ? matchingInfo.accountNumber : (record.virtualAccount || '');
 
-      // 년도 (A열)
       worksheet['A' + currentRow] = { t: 'n', v: year };
-
-      // 월 (B열)
       worksheet['B' + currentRow] = { t: 'n', v: month };
-
-      // 사용시설 (C열)
       worksheet['C' + currentRow] = { t: 's', v: record.facilityName || '' };
-
-      // 금융기관 (D열)
       worksheet['D' + currentRow] = { t: 's', v: bankName };
-
-      // 계좌번호 (E열)
       worksheet['E' + currentRow] = { t: 's', v: accountNumber };
-
-      // 사용기간 시작 (F열)
       worksheet['F' + currentRow] = { t: 's', v: record.startDate || '' };
-
-      // 사용기간 구분자 (G열)
       worksheet['G' + currentRow] = { t: 's', v: '~' };
-
-      // 사용기간 종료 (H열)
       worksheet['H' + currentRow] = { t: 's', v: record.endDate || '' };
-
-      // 납부금액 (I열) - 천단위 콤마
-      worksheet['I' + currentRow] = {
-        t: 'n',
-        v: parseFloat(record.usageCost) || 0,
-        z: '#,##0'
-      };
-
-      // 비고 (J열) - 에너지 종류
+      worksheet['I' + currentRow] = { t: 'n', v: parseFloat(record.usageCost) || 0, z: '#,##0' };
       worksheet['J' + currentRow] = { t: 's', v: record.energyType || '' };
     });
 
-    // 워크시트 범위 업데이트
     const lastDataRow = dataStartRow + records.length - 1;
     worksheet['!ref'] = xlsx.utils.encode_range({
       s: { r: 0, c: 0 },
-      e: { r: lastDataRow, c: 9 }  // J열(인덱스 9)까지
+      e: { r: lastDataRow, c: 9 }
     });
 
-    // 열 너비 설정
     worksheet['!cols'] = [
-      { wch: 8 },   // A: 년도
-      { wch: 6 },   // B: 월
-      { wch: 25 },  // C: 사용시설
-      { wch: 12 },  // D: 금융기관
-      { wch: 18 },  // E: 계좌번호
-      { wch: 12 },  // F: 사용기간 시작
-      { wch: 3 },   // G: ~
-      { wch: 12 },  // H: 사용기간 종료
-      { wch: 15 },  // I: 납부금액
-      { wch: 12 }   // J: 비고
+      { wch: 8 }, { wch: 6 }, { wch: 25 }, { wch: 12 }, { wch: 18 },
+      { wch: 12 }, { wch: 3 }, { wch: 12 }, { wch: 15 }, { wch: 12 }
     ];
 
-    // Excel 파일을 버퍼로 변환
     const buffer = xlsx.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-
-    // 파일명 설정
     const now = new Date();
     const filename = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-통합첨부문서.xlsx`;
 
@@ -1621,14 +1253,16 @@ app.post('/api/generate-attachment-combined', async (req, res) => {
     res.send(buffer);
 
     console.log('통합 첨부문서 생성 완료:', records.length, '건');
-
   } catch (error) {
     console.error('통합 첨부문서 생성 오류:', error);
     res.status(500).json({ success: false, message: '통합 첨부문서 생성 중 오류가 발생했습니다.' });
   }
 });
 
-// 네이버 클로바 OCR API 프록시 엔드포인트
+// ──────────────────────────────────────────────
+// 네이버 클로바 OCR API 프록시
+// ──────────────────────────────────────────────
+
 app.post('/api/clova-ocr', async (req, res) => {
   try {
     const { imageBase64, apiUrl, secretKey } = req.body;
@@ -1643,11 +1277,9 @@ app.post('/api/clova-ocr', async (req, res) => {
       });
     }
 
-    // URL 정리 (끝에 슬래시 제거)
     const cleanApiUrl = apiUrl.replace(/\/$/, '');
     console.log('정리된 API URL:', cleanApiUrl);
 
-    // Base64에서 이미지 포맷 감지
     let imageFormat = 'jpg';
     let contentType = 'image/jpeg';
 
@@ -1661,7 +1293,6 @@ app.post('/api/clova-ocr', async (req, res) => {
 
     console.log('이미지 포맷:', imageFormat);
 
-    // Base64를 Buffer로 변환
     const base64Data = imageBase64.split(',')[1];
     if (!base64Data) {
       throw new Error('올바르지 않은 Base64 데이터');
@@ -1669,13 +1300,11 @@ app.post('/api/clova-ocr', async (req, res) => {
     const imageBuffer = Buffer.from(base64Data, 'base64');
     console.log('이미지 버퍼 크기:', imageBuffer.length, 'bytes');
 
-    // 네이버 클로바 OCR API 호출
     const FormData = require('form-data');
     const axios = require('axios');
 
     const formData = new FormData();
 
-    // OCR 요청 데이터 구성
     const requestJson = {
       version: 'V2',
       requestId: `req_${Date.now()}`,
@@ -1694,13 +1323,8 @@ app.post('/api/clova-ocr', async (req, res) => {
       contentType: contentType
     });
 
-    // API 호출
     console.log('클로바 API 호출 중...');
     console.log('최종 요청 URL:', cleanApiUrl);
-    console.log('요청 헤더:', {
-      ...formData.getHeaders(),
-      'X-OCR-SECRET': '***' // 보안을 위해 마스킹
-    });
 
     const response = await axios.post(cleanApiUrl, formData, {
       headers: {
@@ -1715,13 +1339,10 @@ app.post('/api/clova-ocr', async (req, res) => {
     console.log('클로바 API 응답 상태:', response.status);
     console.log('응답 데이터 구조:', JSON.stringify(response.data).substring(0, 200));
 
-    // OCR 결과에서 텍스트 추출
     let extractedText = '';
     if (response.data && response.data.images && response.data.images[0]) {
       const fields = response.data.images[0].fields || [];
       console.log('추출된 필드 개수:', fields.length);
-
-      // 각 필드의 텍스트를 개행 또는 공백으로 연결
       extractedText = fields.map(field => field.inferText).join('\n');
     }
 
@@ -1744,7 +1365,6 @@ app.post('/api/clova-ocr', async (req, res) => {
       console.error('- 응답 데이터:', JSON.stringify(error.response.data, null, 2));
     }
 
-    // 사용자 친화적인 오류 메시지 생성
     let userMessage = 'OCR 처리 중 오류가 발생했습니다.';
     let errorDetails = null;
 
@@ -1795,7 +1415,10 @@ app.post('/api/clova-ocr', async (req, res) => {
   }
 });
 
+// ──────────────────────────────────────────────
 // 클로바 API 키 검증 엔드포인트
+// ──────────────────────────────────────────────
+
 app.post('/api/validate-clova-key', async (req, res) => {
   try {
     const { apiUrl, secretKey } = req.body;
@@ -1810,7 +1433,6 @@ app.post('/api/validate-clova-key', async (req, res) => {
       });
     }
 
-    // URL 형식 검증
     if (!apiUrl.includes('apigw.ntruss.com')) {
       return res.json({
         success: false,
@@ -1818,7 +1440,6 @@ app.post('/api/validate-clova-key', async (req, res) => {
       });
     }
 
-    // URL이 https로 시작하는지 확인
     if (!apiUrl.startsWith('https://')) {
       return res.json({
         success: false,
@@ -1826,11 +1447,9 @@ app.post('/api/validate-clova-key', async (req, res) => {
       });
     }
 
-    // URL 끝에 슬래시가 있으면 제거
     const cleanApiUrl = apiUrl.replace(/\/$/, '');
     console.log('정리된 API URL:', cleanApiUrl);
 
-    // 간단한 테스트 이미지로 API 키 검증 (1x1 픽셀 PNG)
     const testImageBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
     const testImageBuffer = Buffer.from(testImageBase64, 'base64');
 
@@ -1910,7 +1529,11 @@ app.post('/api/validate-clova-key', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => {
+// ──────────────────────────────────────────────
+// 정적 파일 및 서버 시작
+// ──────────────────────────────────────────────
+
+app.get('/', (_req, res) => {
   res.sendFile(__dirname + '/public/index.html');
 });
 
