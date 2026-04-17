@@ -711,6 +711,8 @@ app.get('/api/data-view', async (req, res) => {
       query = query.lte('billing_month', endMonth);
     }
 
+    query = query.order('billing_month', { ascending: true });
+
     const { data, error } = await query;
     if (error) throw error;
 
@@ -1537,6 +1539,10 @@ app.get('/', (_req, res) => {
   res.sendFile(__dirname + '/public/index.html');
 });
 
-app.listen(PORT, () => {
-  console.log(`에너지 관리 시스템이 http://localhost:${PORT} 에서 실행중입니다.`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`에너지 관리 시스템이 http://localhost:${PORT} 에서 실행중입니다.`);
+  });
+}
+
+module.exports = app;
