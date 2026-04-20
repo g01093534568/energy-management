@@ -3,5 +3,19 @@
     "allow": [
       "Bash(python3:*)"
     ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "STATUS=$(git -C \"/e/[업무]/에너지관리\" status --porcelain 2>/dev/null); if [ -n \"$STATUS\" ]; then git -C \"/e/[업무]/에너지관리\" add -A && git -C \"/e/[업무]/에너지관리\" commit -m \"자동 커밋: $(date +'%Y-%m-%d %H:%M')\" && git -C \"/e/[업무]/에너지관리\" push origin main; fi",
+            "statusMessage": "변경사항 커밋 및 푸시 중..."
+          }
+        ]
+      }
+    ]
   }
 }
