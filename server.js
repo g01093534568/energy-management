@@ -14,6 +14,9 @@ const PORT = 3000;
 const ATTACHMENT_TEMPLATE_FILE = path.join(__dirname, 'public', '첨부 2 서식.xlsx');
 
 // Supabase 클라이언트 초기화
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+  throw new Error('환경변수 SUPABASE_URL 또는 SUPABASE_KEY가 설정되지 않았습니다. Vercel 환경변수를 확인하세요.');
+}
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
