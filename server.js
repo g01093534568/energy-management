@@ -10,7 +10,7 @@ const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3001;
 const ATTACHMENT_TEMPLATE_FILE = path.join(__dirname, 'public', '첨부 2 서식.xlsx');
 
 // Supabase 클라이언트 초기화
@@ -25,13 +25,34 @@ const supabase = createClient(
 // Body parser 설정 - 이미지 업로드를 위해 크기 제한 증가
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
+
+// CORS — worklog-app(파일/로컬 서버)에서 credentials 포함 요청 허용
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  // file:// 프로토콜은 origin이 'null'로 오거나 없음
+  if (!origin || origin === 'null' || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin || 'null');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 app.use(express.static('public'));
 
+app.set('trust proxy', 1); // 프록시(Vercel 등) 환경에서의 세션 신뢰 설정
 app.use(session({
   secret: process.env.SESSION_SECRET || 'energy-management-secret-key',
-  resave: false,
-  saveUninitialized: false,
-  cookie: { maxAge: 24 * 60 * 60 * 1000 }
+  resave: true, // 세션 변경 사항을 강제로 저장하여 유실 방지
+  saveUninitialized: false, // 빈 세션 생성 방지
+  cookie: {
+    maxAge: 24 * 60 * 60 * 1000,
+    secure: false,
+    httpOnly: true,
+    sameSite: 'lax' // cross-origin 요청에서도 쿠키 전송
+  }
 }));
 
 // ──────────────────────────────────────────────
@@ -83,29 +104,68 @@ function rowToEnergyInfo(row) {
 app.post('/api/login', async (req, res) => {
   const { facilityName, username, password } = req.body;
 
-  console.log('로그인 시도:', { facilityName, username, password });
+  const cleanUsername = (username || '').trim();
+  const cleanFacility = (facilityName || '').trim();
+  const cleanPassword = password || '';
 
   try {
-    const { data, error } = await supabase
+    // 1. 아이디로만 먼저 사용자 목록을 가져옵니다. (공백 문제 해결을 위해 비번은 JS에서 비교)
+    const { data: potentialUsers, error } = await supabase
       .from('users')
       .select('*')
-      .eq('facility_name', facilityName)
-      .eq('username', username)
-      .eq('password', password)
-      .single();
+      .ilike('username', cleanUsername); // 대소문자 구분 없이 아이디 조회
 
-    if (error || !data) {
-      console.log('로그인 실패');
-      return res.json({ success: false, message: '시설명, 아이디 또는 비밀번호가 올바르지 않습니다.' });
+    if (error) {
+      console.error('로그인 쿼리 오류:', error.message);
+      return res.status(500).json({ success: false, message: '서버 통신 중 오류가 발생했습니다.' });
+    }
+
+    // 2. 비밀번호 비교 (사용자의 "정확한" 입력을 존중하기 위해 trim을 제거하고 엄격하게 비교)
+    const users = (potentialUsers || []).filter(u => 
+      String(u.password || '') === String(cleanPassword)
+    );
+
+    if (users.length === 0) {
+      return res.json({ success: false, message: '아이디 또는 비밀번호를 확인해주세요.' });
+    }
+
+    // [해결] 중복 아이디 대응: 입력한 시설명과 가장 유사한 계정 선택
+    // 시설명이 비어있는 관리자 계정 등은 아이디 매칭으로 구제
+    const normalize = (s) => (s || '').replace(/\s/g, '').toLowerCase();
+    const inputFacilityNorm = normalize(cleanFacility);
+
+    let user = users.find(u => {
+      const dbFacilityNorm = normalize(u.facility_name);
+      const dbUsernameNorm = normalize(u.username);
+      return (dbFacilityNorm === inputFacilityNorm) || 
+             (dbUsernameNorm === inputFacilityNorm) ||
+             (u.role === '관리자' && (inputFacilityNorm === '관리자' || inputFacilityNorm === ''));
+    });
+
+    // 만약 시설명이 정확하지 않더라도 아이디/비번이 맞는 계정이 하나뿐이면 로그인 허용
+    if (!user && users.length === 1) {
+      user = users[0];
+    }
+
+    if (!user) {
+      return res.json({ success: false, message: '시설명이 일치하지 않습니다.' });
     }
 
     req.session.user = {
-      id: data.username,
-      facilityName: data.facility_name,
-      role: data.role || '시설담당자'
+      id: String(user.username).trim(),
+      facilityName: String(user.facility_name || '').trim() || String(cleanFacility || '').trim() || '관리자',
+      role: user.role || '시설담당자'
     };
-    console.log('로그인 성공:', req.session.user);
-    res.json({ success: true, user: req.session.user });
+
+    // [핵심] 세션을 확실히 저장한 후 응답을 보내야 새로고침 시 튕기지 않음
+    req.session.save((err) => {
+      if (err) {
+        console.error('세션 저장 실패:', err);
+        return res.status(500).json({ success: false, message: '세션 저장 중 오류가 발생했습니다.' });
+      }
+      res.json({ success: true, user: req.session.user });
+    });
+
   } catch (err) {
     console.error('로그인 오류:', err);
     res.status(500).json({ success: false, message: '로그인 중 오류가 발생했습니다.' });
@@ -115,6 +175,56 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/logout', (req, res) => {
   req.session.destroy();
   res.json({ success: true });
+});
+
+// worklog-app 진입 시 에너지 관리 세션 자동 생성 (로그인 폼 없음)
+app.post('/api/auto-login-worklog', async (req, res) => {
+  const { facilityName = '', username = '' } = req.body;
+  try {
+    let sessionUser;
+
+    if (facilityName && username) {
+      // worklog 사용자 정보가 있으면 users 테이블에서 매칭 계정 검색
+      const { data: rows } = await supabase
+        .from('users')
+        .select('*')
+        .or(`facility_name.ilike.${facilityName},username.ilike.${username}`)
+        .limit(5);
+
+      if (rows && rows.length > 0) {
+        const exact = rows.find(r =>
+          (r.facility_name || '').replace(/\s/g,'').toLowerCase() === facilityName.replace(/\s/g,'').toLowerCase() &&
+          (r.username || '').replace(/\s/g,'').toLowerCase() === username.replace(/\s/g,'').toLowerCase()
+        );
+        const matched = exact || rows[0];
+        sessionUser = {
+          username: matched.username,
+          facilityName: matched.facility_name || facilityName,
+          role: matched.role || '시설담당자',
+          id: matched.username
+        };
+      }
+    }
+
+    // 매칭 계정이 없거나 정보 미제공 시 → 관리자 세션으로 자동 생성
+    if (!sessionUser) {
+      sessionUser = {
+        username: username || 'worklog-user',
+        facilityName: facilityName || '관리자',
+        role: '관리자',
+        id: username || 'worklog-user'
+      };
+    }
+
+    req.session.user = sessionUser;
+    req.session.save((err) => {
+      if (err) return res.status(500).json({ success: false, message: '세션 저장 실패' });
+      res.json({ success: true, user: sessionUser });
+    });
+  } catch (error) {
+    console.error('자동 로그인 오류:', error);
+    res.status(500).json({ success: false, message: '서버 오류' });
+  }
 });
 
 app.get('/api/check-auth', (req, res) => {
@@ -143,9 +253,10 @@ app.get('/api/facilities', async (req, res) => {
     if (userRole === '관리자') {
       // 관리자: 모든 시설 조회
     } else if (userRole === '시설관리자') {
-      // 시설관리자: 본인 시설 + parentFacility가 본인인 시설담당자
+      // [개선] 시설명이 없는 경우 username을 기준으로 조회
+      const matchName = userFacilityName || req.session.user.id;
       query = query.or(
-        `facility_name.eq.${userFacilityName},and(parent_facility.eq.${userFacilityName},role.eq.시설담당자)`
+        `facility_name.eq."${matchName}",parent_facility.eq."${matchName}",username.eq."${matchName}"`
       );
     } else {
       // 시설담당자: 본인 시설만
@@ -295,6 +406,27 @@ app.put('/api/facilities/:id', async (req, res) => {
   }
 });
 
+// 벌크 삭제 엔드포인트 추가
+app.post('/api/facilities/bulk-delete', async (req, res) => {
+  if (!req.session.user || req.session.user.role !== '관리자') {
+    return res.status(403).json({ success: false, message: '권한이 없습니다.' });
+  }
+
+  const { ids } = req.body;
+  try {
+    const { error, count } = await supabase
+      .from('users')
+      .delete()
+      .in('id', ids);
+
+    if (error) throw error;
+    res.json({ success: true, message: `${ids.length}개의 시설이 삭제되었습니다.` });
+  } catch (err) {
+    console.error('벌크 삭제 오류:', err);
+    res.status(500).json({ success: false, message: '삭제 중 오류가 발생했습니다.' });
+  }
+});
+
 app.delete('/api/facilities/:id', async (req, res) => {
   if (!req.session.user) {
     return res.status(401).json({ success: false, message: '인증이 필요합니다.' });
@@ -329,6 +461,7 @@ app.delete('/api/facilities/:id', async (req, res) => {
       }
     }
 
+    // 시설(사용자) 정보만 삭제하며, energy_records에 기록된 데이터는 보존 정책에 따라 유지됩니다.
     const { error } = await supabase.from('users').delete().eq('id', targetId);
     if (error) throw error;
 
@@ -347,9 +480,9 @@ app.delete('/api/facilities/:id', async (req, res) => {
 async function getManagedFacilityNames(userFacilityName) {
   const { data } = await supabase
     .from('users')
-    .select('facility_name')
-    .or(`facility_name.eq.${userFacilityName},and(parent_facility.eq.${userFacilityName},role.eq.시설담당자)`);
-  return (data || []).map(u => u.facility_name);
+    .select('facility_name, username')
+    .or(`facility_name.eq."${userFacilityName}",parent_facility.eq."${userFacilityName}"`);
+  return (data || []).map(u => u.facility_name || u.username);
 }
 
 app.get('/api/energy', async (req, res) => {
@@ -714,6 +847,17 @@ app.get('/api/data-view', async (req, res) => {
       query = query.lte('billing_month', endMonth);
     }
 
+    // 시설 필터 (하위 시설 포함 - 클라이언트 측 필터링)
+    let filterFacilities = [];
+    if (facility) {
+      const { data: childData } = await supabase
+        .from('users')
+        .select('facility_name')
+        .eq('parent_facility', facility);
+      filterFacilities = [facility, ...(childData || []).map(u => u.facility_name)];
+      query = query.in('facility_name', filterFacilities);
+    }
+
     query = query.order('billing_month', { ascending: true });
 
     const { data, error } = await query;
@@ -721,21 +865,12 @@ app.get('/api/data-view', async (req, res) => {
 
     let records = (data || []).map(rowToEnergyRecord);
 
-    // 시설 필터 (하위 시설 포함 - 클라이언트 측 필터링)
-    if (facility) {
-      // 선택한 시설의 하위 시설 목록 조회
-      const { data: childData } = await supabase
-        .from('users')
-        .select('facility_name')
-        .eq('parent_facility', facility);
-      const childFacilities = (childData || []).map(u => u.facility_name);
-
-      records = records.filter(record => {
-        if (record.facilityName === facility) return true;
-        if (childFacilities.includes(record.facilityName)) return true;
-        if (record.facilityName.startsWith(facility + '(')) return true;
-        return false;
-      });
+    // [보완] 복합 시설명 대응 필터링 (DB에서 처리하기 어려운 경우)
+    if (facility && filterFacilities.length > 0) {
+        records = records.filter(record => 
+            filterFacilities.includes(record.facilityName) || 
+            record.facilityName.startsWith(facility + '(')
+        );
     }
 
     console.log('=== 데이터 조회 API 응답 ===');
