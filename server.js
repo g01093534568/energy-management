@@ -48,7 +48,7 @@ app.use(express.static('public'));
 
 app.set('trust proxy', 1);
 
-const WORKLOG_TOKEN = process.env.SESSION_SECRET || 'energy-management-secret-key';
+const WORKLOG_TOKEN = (process.env.SESSION_SECRET || 'energy-management-secret-key').trim();
 
 const isProduction = !!(process.env.VERCEL || process.env.NODE_ENV === 'production');
 app.use(session({
