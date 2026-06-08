@@ -26,11 +26,15 @@ const supabase = createClient(
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 
-// CORS — worklog-app(파일/로컬 서버)에서 credentials 포함 요청 허용
+// CORS — worklog-app(로컬/Vercel)에서 credentials 포함 요청 허용
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  // file:// 프로토콜은 origin이 'null'로 오거나 없음
-  if (!origin || origin === 'null' || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+  const allowed =
+    !origin ||
+    origin === 'null' ||
+    /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
+    /^https:\/\/.*\.vercel\.app$/.test(origin);
+  if (allowed) {
     res.setHeader('Access-Control-Allow-Origin', origin || 'null');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
   }
