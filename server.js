@@ -46,18 +46,31 @@ app.use((req, res, next) => {
 
 app.use(express.static('public'));
 
-app.set('trust proxy', 1); // 프록시(Vercel 등) 환경에서의 세션 신뢰 설정
+app.set('trust proxy', 1);
+
+const WORKLOG_TOKEN = process.env.SESSION_SECRET || 'energy-management-secret-key';
+
+const isProduction = !!(process.env.VERCEL || process.env.NODE_ENV === 'production');
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'energy-management-secret-key',
-  resave: true, // 세션 변경 사항을 강제로 저장하여 유실 방지
-  saveUninitialized: false, // 빈 세션 생성 방지
+  secret: WORKLOG_TOKEN,
+  resave: false,
+  saveUninitialized: false,
   cookie: {
     maxAge: 24 * 60 * 60 * 1000,
-    secure: false,
+    secure: isProduction,
     httpOnly: true,
-    sameSite: 'lax' // cross-origin 요청에서도 쿠키 전송
+    sameSite: isProduction ? 'none' : 'lax'
   }
 }));
+
+// worklog-app에서 X-Worklog-Token 헤더로 인증 — Vercel 서버리스 세션 유실 대비
+app.use((req, res, next) => {
+  const token = req.headers['x-worklog-token'];
+  if (token && token === WORKLOG_TOKEN && !req.session.user) {
+    req.session.user = { username: 'worklog-user', facilityName: '관리자', role: '관리자', id: 'worklog-user' };
+  }
+  next();
+});
 
 // ──────────────────────────────────────────────
 // 헬퍼: Supabase 행(snake_case) → camelCase 변환
@@ -223,7 +236,7 @@ app.post('/api/auto-login-worklog', async (req, res) => {
     req.session.user = sessionUser;
     req.session.save((err) => {
       if (err) return res.status(500).json({ success: false, message: '세션 저장 실패' });
-      res.json({ success: true, user: sessionUser });
+      res.json({ success: true, user: sessionUser, token: WORKLOG_TOKEN });
     });
   } catch (error) {
     console.error('자동 로그인 오류:', error);
